@@ -1,0 +1,20 @@
+{
+    "permissions": {
+        "allow": [
+            "Bash(npx cdk deploy:*)",
+            "Bash(npx cdk destroy:*)",
+            "Bash(npx cdk diff:*)",
+            "Bash(npx cdk synth:*)",
+            "Bash(npm run:*)",
+            "Bash(npm test:*)",
+            "Bash(./scripts/*.sh)",
+            "Bash(aws cloudformation:*)",
+            "Bash(aws logs:*)",
+            "Bash(aws cognito-idp:*)",
+            "Bash(aws apigateway:*)",
+            "Bash(aws bedrock-agentcore:*)",
+            "Bash(aws secretsmanager put-secret-value:*)",
+            "Bash(python3 -m http.server:*)"
+        ]
+    }
+}

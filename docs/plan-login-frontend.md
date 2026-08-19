@@ -38,16 +38,29 @@ docker info >/dev/null && echo docker ok      # needed for the Runtime image
 cd /Users/jakub.wi/Desktop/ai_app && npm test # 174 must pass before you change anything
 ```
 
-**Deploy permission.** `cdk deploy` is normally blocked by the auto-mode classifier. Jakub was
-asked to add `.claude/settings.json` with allow rules before leaving. Check it exists:
+**Deploy permission.** `cdk deploy` is normally blocked by the auto-mode classifier. Jakub added
+allow rules to `.claude/settings.json` before leaving. Check them:
 
 ```bash
 cat .claude/settings.json
 ```
 
-If it does not exist, or a deploy is refused anyway: **do all the code work, commit it, run
-`cdk diff` and `npm run verify:bundle`, write what is left into this file's "Progress log", and
-stop.** Do not try to work around the classifier.
+**Deploy and destroy through the wrappers, never by hand:**
+
+```bash
+./scripts/deploy.sh        # cdk diff, then cdk deploy --profile ai-playground
+./scripts/destroy.sh       # cdk destroy, then proves the stack is gone
+```
+
+They exist because permission rules match on the prefix of the *whole* command string, so
+`cd infra && AWS_PROFILE=x npx cdk deploy ...` is a bad thing to try to allow — the `cd` and the
+env-var assignment come first. One script is one exact string a rule can name. They also pin
+`--profile ai-playground`, because the default profile points at a corporate account.
+
+If a deploy is refused anyway: **do all the code work, commit it, run `cdk diff` and
+`npm run verify:bundle`, write into the "Progress log" below both what is left *and the exact
+command that was refused*, and stop.** Do not try to work around the classifier — a refusal is
+a decision, and Jakub can lift it in one line when he is back.
 
 ---
 
@@ -168,8 +181,7 @@ callback URL.
 ## Phase 3 — deploy
 
 ```bash
-cd infra && AWS_PROFILE=ai-playground npx cdk diff        # show it, read it
-AWS_PROFILE=ai-playground npx cdk deploy --require-approval never
+./scripts/deploy.sh          # diffs first, then deploys — read the diff
 ```
 
 Then the test user:
@@ -265,9 +277,7 @@ work — the new client must not have broken the old one) and `npm test`.
 ## When you are done
 
 ```bash
-cd infra && AWS_PROFILE=ai-playground npx cdk destroy --force
-aws cloudformation describe-stacks --stack-name TravelAssistantStack \
-  --query 'Stacks[0].StackStatus' --output text 2>&1 | tail -1   # must say it does not exist
+./scripts/destroy.sh         # destroys, then fails loudly if the stack is still there
 ```
 
 **Destroy even if Phase 4 failed.** Nothing stays up overnight; that is the rule the budget
