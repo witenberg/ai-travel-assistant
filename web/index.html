@@ -1,0 +1,76 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Travel assistant — login harness</title>
+
+<!--
+  One page, no framework, no build step. The project's rule is that application logic stays
+  thin so the infrastructure stays the interesting part (README.md): React plus a bundler
+  would have been more lines than the entire login flow it was meant to display.
+
+  What this page is for: proving that a *human* reaches the agent. Everything it shows —
+  the subject, the granted scopes, the session id, the per-tool verdicts — exists because
+  it is the evidence for one of those claims, not because a user would want to see it.
+-->
+
+<link rel="stylesheet" href="style.css">
+
+<main>
+  <h1>Travel assistant</h1>
+  <p class="lede">
+    A test harness for the login edge of the architecture: log in as a real Cognito user,
+    pick the scopes your token asks for, and watch the Gateway interceptor honour them.
+  </p>
+
+  <!-- ── logged out ────────────────────────────────────────────────────────── -->
+  <section id="anon">
+    <h2>1 · Choose what the token may do</h2>
+    <p class="note">
+      Cognito scopes are per <em>client and request</em>, not per user, so the honest way to
+      show a permission difference is to ask for a different token. Uncheck a box and the
+      agent loses that tool — same code, same user, different token.
+    </p>
+    <fieldset id="scopes">
+      <legend>Scopes to request</legend>
+      <label><input type="checkbox" value="tools/places:read" checked> <code>places:read</code> — Wikipedia summaries</label>
+      <label><input type="checkbox" value="tools/weather:read" checked> <code>weather:read</code> — 7-day forecast</label>
+      <label><input type="checkbox" value="tools/photos:search" checked> <code>photos:search</code> — Wikimedia Commons</label>
+      <label><input type="checkbox" value="tools/flights:read" checked> <code>flights:read</code> — Duffel offers</label>
+    </fieldset>
+    <button id="login" class="primary">Log in with Cognito</button>
+    <p class="note">Opens the Cognito hosted UI. Authorization-code flow with PKCE, no client secret.</p>
+  </section>
+
+  <!-- ── logged in ─────────────────────────────────────────────────────────── -->
+  <section id="signed-in" hidden>
+    <h2>2 · Who you are</h2>
+    <dl id="identity"></dl>
+    <button id="logout">Log out</button>
+
+    <h2>3 · Ask</h2>
+    <form id="ask">
+      <textarea id="prompt" rows="3" placeholder="What is the weather in Lisbon this weekend?"></textarea>
+      <button id="send" class="primary" type="submit">Send</button>
+    </form>
+    <div id="answer" hidden>
+      <p id="answer-text"></p>
+      <div id="tools"></div>
+      <p class="meta" id="meta"></p>
+    </div>
+  </section>
+
+  <p id="error" class="error" hidden></p>
+
+  <footer>
+    <p>
+      The API key in <code>config.js</code> is <strong>not a secret here, and cannot be</strong>:
+      anything a browser sends is readable by whoever holds the browser. It stays because it is
+      what attaches this API to a usage plan, and the usage plan's 100 requests/day is the cap
+      on what a runaway page can spend. In a real deployment the key would live behind a server
+      that holds it on the user's behalf — which is the same argument ADR-0001 makes for the BFF.
+    </p>
+  </footer>
+</main>
+
+<script src="config.js"></script>
+<script type="module" src="app.js"></script>

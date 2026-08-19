@@ -7,3 +7,9 @@ dist/
 # Generated .http files hold a client secret and an API key
 requests/local.http
 requests/local-gateway.http
+
+# Generated: real client id and API key, both public-by-construction but not ours to commit
+web/config.js
+
+# The Cognito test user's password, created by CLI after deploy (never in a template)
+.test-user

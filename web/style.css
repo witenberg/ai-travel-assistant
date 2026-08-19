@@ -1,0 +1,57 @@
+/* Hand-written, ~80 lines. Dark-on-light, one accent, no framework — see index.html. */
+:root {
+  --ink: #1a1a1a;
+  --muted: #666;
+  --line: #ddd;
+  --accent: #1d4ed8;
+  --bad: #b91c1c;
+  --good: #15803d;
+  --bg-soft: #f6f7f9;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  color: var(--ink);
+  background: #fff;
+}
+main { max-width: 44rem; margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
+h1 { font-size: 1.6rem; margin: 0 0 .25rem; }
+h2 { font-size: 1rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 2rem 0 .6rem; }
+.lede { color: var(--muted); margin: 0 0 1.5rem; }
+.note { color: var(--muted); font-size: .85rem; margin: .5rem 0 1rem; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9em; }
+
+fieldset { border: 1px solid var(--line); border-radius: 6px; padding: .75rem 1rem 1rem; }
+legend { font-size: .8rem; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+fieldset label { display: block; padding: .2rem 0; }
+
+button {
+  font: inherit; padding: .55rem 1.1rem; border-radius: 6px;
+  border: 1px solid var(--line); background: #fff; cursor: pointer;
+}
+button:hover { background: var(--bg-soft); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.primary:hover { filter: brightness(1.1); }
+button[disabled] { opacity: .5; cursor: progress; }
+
+dl { display: grid; grid-template-columns: max-content 1fr; gap: .3rem 1rem; margin: 0 0 1rem;
+     background: var(--bg-soft); padding: .9rem 1rem; border-radius: 6px; }
+dt { color: var(--muted); font-size: .85rem; }
+dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85rem; word-break: break-all; }
+
+textarea { width: 100%; font: inherit; padding: .6rem; border: 1px solid var(--line); border-radius: 6px; resize: vertical; }
+form { display: grid; gap: .6rem; justify-items: start; }
+
+#answer { border-left: 3px solid var(--accent); padding: .2rem 0 .2rem 1rem; margin-top: 1.5rem; }
+#answer-text { white-space: pre-wrap; margin: 0; }
+#tools { display: flex; flex-wrap: wrap; gap: .4rem; margin: .9rem 0 0; }
+.badge {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .78rem;
+  padding: .15rem .5rem; border-radius: 999px; border: 1px solid currentColor;
+}
+.badge.ok { color: var(--good); }
+.badge.blocked { color: var(--bad); }
+.meta { color: var(--muted); font-size: .78rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin: .8rem 0 0; }
+.error { color: var(--bad); border: 1px solid currentColor; border-radius: 6px; padding: .7rem 1rem; white-space: pre-wrap; }
+footer { margin-top: 3.5rem; padding-top: 1rem; border-top: 1px solid var(--line); color: var(--muted); font-size: .8rem; }
