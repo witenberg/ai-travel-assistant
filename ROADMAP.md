@@ -45,11 +45,8 @@ Docker Desktop must be running before any deploy that rebuilds the image.
 - `Session → trace → span` reaching CloudWatch from the deployed Runtime
 - `search_flights` (Duffel) with its key read from the AgentCore Identity token vault —
   deployed and verified, see Step 2
-- One CDK stack: Cognito, DynamoDB, Secrets Manager, Identity credential provider,
-  Memory, Runtime, Gateway, log groups
-
-**Created but unused:**
-- DynamoDB table — no code touches it (step 6 decides its fate)
+- One CDK stack: Cognito, Secrets Manager, Identity credential provider, Memory, Runtime,
+  Gateway, log groups
 
 **Not built:**
 - CI/CD
@@ -412,11 +409,28 @@ old sessions — `eventExpiryDuration: 7` handles that for us.
 
 ---
 
-## Step 6 — Give the DynamoDB table a job, or delete it
+## Step 6 — The DynamoDB table — **DONE (2026-08-19): deleted**
 
-An unused resource contradicts our own Cost Optimization stance. Either it stores
-something real (saved itineraries, a per-user profile that outlives Memory expiry) or it
-goes. **Deleting it is a perfectly good outcome** — do not invent a use for it.
+Decision and rejected alternatives: [ADR-0005](docs/adr/0005-no-application-data-store.md).
+
+The table had existed since the first deploy and **no code had ever touched it** — the runtime
+role held `grantReadWriteData` and the container held `TABLE_NAME`, both for nothing. The two
+kinds of state this system has are already placed: what the agent should remember about a
+person is a preference (AgentCore Memory, keyed on the actor), and what it tells the user is
+fresher from the source than from any store. So the table goes, along with its grant, its
+environment variable and its stack output.
+
+The saving is not money — an on-demand table costs near nothing at rest. It is consistency:
+we argue every component from Well-Architected, and a component that exists because a diagram
+drew it fails that test on the pillar we said dominates. An empty resource is also worse than
+no resource, because it invites code to be written for the resource's sake.
+
+**Verified:** `cdk diff` showed the table as the only removal, with nothing else replaced.
+`AgentCore Memory is now the system's only state`, and the smoke scripts still pass.
+
+**Comes back when, and only when,** something needs it — saved itineraries being the obvious
+candidate. Re-adding the table is ten lines of CDK; deciding what it stores is the work, and
+that belongs to the feature.
 
 ---
 
@@ -449,7 +463,7 @@ Depends on Step 0 and a remote. The mentoring goals name CI/CD explicitly.
 | Decision | Notes |
 |---|---|
 | ~~Lambda vs OpenAPI Gateway targets~~ | Decided in ADR-0004: Lambda target for the three keyless tools, `search_flights` stays in the Runtime |
-| Whether the DynamoDB table survives | Step 6; deletion is fine |
+| ~~Whether the DynamoDB table survives~~ | Decided in ADR-0005: deleted |
 | Whether a frontend is ever built | Deferred; `curl` remains the interface |
 | Git remote and where CI runs | Step 0/7 |
 

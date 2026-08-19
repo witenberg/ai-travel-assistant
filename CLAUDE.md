@@ -38,7 +38,6 @@ flowchart LR
     RT["AgentCore Runtime<br/>travel assistant agent"]
     LLM[Amazon Bedrock LLMs]
     MEM["AgentCore Memory<br/>short-term + long-term"]
-    DDB[(DynamoDB<br/>app data)]
     OBS[AgentCore Observability]
     CW[CloudWatch]
     IDN["AgentCore Identity<br/>inbound + outbound"]
@@ -58,7 +57,6 @@ flowchart LR
 
     RT -- "reasoning" --> LLM
     RT -- "session & preferences" --> MEM
-    RT -- "app data" --> DDB
     RT -- "send agent traces" --> OBS --> CW
 
     RT -- "tool calls" --> GW
@@ -147,6 +145,12 @@ Each of these cost a deploy cycle. None is guessable from the docs alone.
 - **Querying JSON logs needs the JSON filter syntax:** `--filter-pattern '{ $.type = "span" }'`.
   A quoted substring pattern like `'"type":"span"'` matches nothing and looks exactly
   like an empty log group.
+- **An existing session keeps its warm container across a deploy.** After a runtime update
+  removed an environment variable, the next request on an established session was still served
+  by the old container — same cached state, no new startup diagnostics. So a `200` right after a
+  deploy can be the *previous* version answering. A session id nothing has used before forces a
+  cold container on the new version, and that is the only run that proves the change:
+  `aws bedrock-agentcore invoke-agent-runtime --runtime-session-id <fresh 33+ chars> ...`.
 - **A fresh container starts per session.** The log group shows one
   `agent listening on 0.0.0.0:8080` line per session, which is normal isolation,
   not a crash loop.
@@ -418,8 +422,9 @@ in the cloud: `./scripts/smoke-flights.sh` returned five real offers with prices
 **Memory is wired in and verified (ADR-0003):** short-term history works end to end in
 the cloud — a follow-up question with no place name in it was answered with the place
 name from the previous turn, and both turns read back from `list-events`. Long-term
-extraction is live but has produced no records yet; see ROADMAP step 5. The DynamoDB
-table is now the one resource nothing touches — ROADMAP step 6 decides its fate.
+extraction produced two correct preference records a few minutes later; see ROADMAP step 5.
+**AgentCore Memory is now the system's only state** — the unused DynamoDB table is gone
+(ADR-0005).
 
 **Workflow note:** `cdk deploy` is blocked by the auto-mode classifier — Jakub must run
 that one command himself with the `!` prefix. `synth`, `diff` and `destroy` go through
@@ -438,6 +443,14 @@ budget allows. Application logic stays deliberately small so the infrastructure 
 the interesting part. Full statement in `README.md`.
 
 ## Decisions made
+
+- **ADR-0005** — the DynamoDB table is deleted; AgentCore Memory is the only state the system
+  keeps. Nothing had ever read or written it: what the agent should remember about a person is
+  a preference (Memory, keyed on the actor), and what it tells the user is fresher from the
+  source than from any cache. Rejected: a cache in front of the three keyless APIs, which
+  under a 100-requests/day quota relieves no load and makes answers older while adding
+  invalidation; and storing transcripts, which is what Memory's short-term store already is,
+  with a second place for a `sessionId` bug to leak one user's history into another's.
 
 - **ADR-0004** — the three keyless tools move behind AgentCore Gateway as one Lambda target,
   and the **caller's own Cognito token** is forwarded (BFF → Runtime → Gateway) so a REQUEST
@@ -521,6 +534,11 @@ the photos really are from the place rather than name-matched.
 
 The cost is that we will not exercise AgentCore Browser hands-on — but spending budget
 on a component whose free alternative is better would teach the wrong lesson.
+
+**The DynamoDB "app data" table is gone.** Full argument in ADR-0005: nothing ever read or
+wrote it, and the two kinds of state this system has are both covered — preferences by
+AgentCore Memory, everything else by a tool that fetches it fresher. Third deviation, same
+shape as the other two: drop what adds no data.
 
 **`get_place_details` uses the Wikipedia REST API instead of model knowledge.**
 The diagram describes this tool as "Destination info → LLM knowledge", but a tool whose

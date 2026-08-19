@@ -3,7 +3,6 @@ import {
 } from 'aws-cdk-lib';
 import type { Construct } from 'constructs';
 import * as iam from 'aws-cdk-lib/aws-iam';
-import * as ddb from 'aws-cdk-lib/aws-dynamodb';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as secrets from 'aws-cdk-lib/aws-secretsmanager';
 import * as agentcore from 'aws-cdk-lib/aws-bedrockagentcore';
@@ -72,14 +71,17 @@ export class TravelAssistantStack extends Stack {
       },
     });
 
-    // ---------------------------------------------------------------- application data
-    const table = new ddb.Table(this, 'AppData', {
-      partitionKey: { name: 'pk', type: ddb.AttributeType.STRING },
-      sortKey: { name: 'sk', type: ddb.AttributeType.STRING },
-      // On-demand: no idle cost, which is the only acceptable mode on this budget.
-      billingMode: ddb.BillingMode.PAY_PER_REQUEST,
-      removalPolicy: RemovalPolicy.DESTROY,
-    });
+    /*
+     * No application data store, and that is a decision — ADR-0005.
+     *
+     * The FigJam diagram draws a DynamoDB table for "app data", and this stack carried one
+     * for four steps without a single line of code touching it. Everything the agent needs
+     * to remember is either a preference (AgentCore Memory, keyed on the actor and outliving
+     * any conversation) or a fact a tool fetches fresher and for free. An idle table
+     * contradicts the Cost Optimization stance the rest of the design is argued from, and an
+     * empty resource is worse than no resource: it invites code to be written against it for
+     * the resource's sake.
+     */
 
     // ---------------------------------------------------------------- identity (outbound)
     // ADR-0002: Secrets Manager holds the token, AgentCore Identity serves it to the
@@ -230,7 +232,6 @@ export class TravelAssistantStack extends Stack {
       ],
     }));
 
-    table.grantReadWriteData(runtimeRole);
     image.repository.grantPull(runtimeRole);
 
     // CreateLogGroup matters: AgentCore creates the runtime's log group itself, and
@@ -446,7 +447,6 @@ export class TravelAssistantStack extends Stack {
       protocolConfiguration: 'HTTP',
       environmentVariables: {
         MODEL_ID,
-        TABLE_NAME: table.tableName,
         MEMORY_ID: memory.attrMemoryId,
         DUFFEL_CREDENTIAL_PROVIDER: duffelCredentials.name,
         // Presence of this variable is what switches the agent from in-process tools to the
@@ -603,7 +603,6 @@ export class TravelAssistantStack extends Stack {
     new CfnOutput(this, 'MachineClientId', { value: machineClient.userPoolClientId });
     new CfnOutput(this, 'TokenEndpoint', { value: `${userPoolDomain.baseUrl()}/oauth2/token` });
     new CfnOutput(this, 'DuffelSecretArn', { value: duffelSecret.secretArn });
-    new CfnOutput(this, 'TableName', { value: table.tableName });
     new CfnOutput(this, 'MemoryId', { value: memory.attrMemoryId });
     new CfnOutput(this, 'ApiUrl', { value: `${api.url}chat` });
     new CfnOutput(this, 'ApiKeyId', { value: apiKey.keyId });
