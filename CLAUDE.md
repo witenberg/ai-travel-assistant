@@ -148,6 +148,28 @@ Each of these cost a deploy cycle. None is guessable from the docs alone.
   `agent listening on 0.0.0.0:8080` line per session, which is normal isolation,
   not a crash loop.
 
+## API Gateway and Lambda — lessons paid for in deploys
+
+- **A new API key needs ~a minute to propagate.** Immediately after `cdk deploy` a
+  correct request returns `403` with `x-amzn-errortype: ForbiddenException` and
+  `{"message":"Forbidden"}`. Every piece of configuration — usage plan, stage
+  association, key state, authorizer, scopes — checked out fine; only time was missing.
+  Diagnostic: a 403 whose body is *not* our JSON error shape means the request never
+  reached the integration.
+- **Bundle the Lambda as CJS, not ESM.** AWS SDK v3 is CommonJS internally; bundled into
+  an ESM output it calls `require("node:https")` at load time and the function dies in
+  INIT with `Dynamic require of "node:https" is not supported`. API Gateway shows only a
+  bare `502 Internal server error`. The common `createRequire` banner hides the mismatch
+  rather than removing it. Our source stays ESM; only esbuild's output format changed.
+- **`cdk synth` succeeding says nothing about the bundle running.** The unit tests import
+  TypeScript source, and synth only checks that esbuild exited zero. `npm run verify:bundle`
+  loads the artifact from `cdk.out` the way Lambda does — this is the same principle as
+  "`READY` and `200` do not mean it works", one layer down.
+- **`cdk.out` inherits `infra/package.json`'s `"type": "module"`.** A CJS bundle sitting
+  there is parsed as ESM by Node and appears to export nothing. Lambda unzips the asset
+  with no such parent, so any check must copy the artifact out of the tree first —
+  otherwise it reports a failure that will not happen, or misses one that will.
+
 ## Tool design principles
 
 Lessons from the first iteration, each paid for with a real agent failure:
@@ -204,13 +226,14 @@ guardrail that stays. We deploy through the CDK bootstrap roles (variant B in
 | Credential provider | `token-vault/default/apikeycredentialprovider/duffel-api-key` |
 | Cognito | `us-east-1_WuhBjq1L7`, machine client `2499r5au4tmahnuon9daeruiid` |
 | Log group | `/aws/bedrock-agentcore/runtimes/travel_assistant-m6PLoMGxv5-DEFAULT` |
+| API | `https://ef1qmnowze.execute-api.us-east-1.amazonaws.com/v1/chat` |
+| Lambda BFF | `travel-assistant-bff`, log group `/aws/lambda/travel-assistant-bff` |
+| Usage plan | `travel-assistant-plan` — 2 rps, burst 5, 100 requests/day |
 
 Invoke it with `aws bedrock-agentcore invoke-agent-runtime`; the session id must be at
 least 33 characters. Payload is `{"prompt": "...", "scopes": [...]}` base64-encoded.
 
-**Not deployed yet:** API Gateway and the Lambda BFF are **written and synthesised** but
-not yet deployed (Step 3 in `ROADMAP.md`); AgentCore Gateway with tool targets is not
-built. All of it goes into this same stack.
+**Not deployed yet:** AgentCore Gateway with tool targets. It goes into this same stack.
 
 **Still a placeholder:** the Duffel secret holds `REPLACE_ME`, and the tool does not yet
 read from the Identity token vault, so `search_flights` fails in the cloud. The other

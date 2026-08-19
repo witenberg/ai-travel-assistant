@@ -35,6 +35,8 @@ Docker Desktop must be running before any deploy that rebuilds the image.
 - Three tools: `get_place_details` (Wikipedia), `get_weather` (open-meteo),
   `get_photos` (Wikimedia Commons)
 - Scope enforcement locally via `src/guard.ts`, with a `blocked` span
+- Entry layer: API Gateway (Cognito authorizer, API key, usage plan, throttling) and the
+  Lambda BFF — deployed and verified, see Step 3
 - `Session → trace → span` reaching CloudWatch from the deployed Runtime
 - One CDK stack: Cognito, DynamoDB, Secrets Manager, Identity credential provider,
   Memory, Runtime, log group
@@ -46,9 +48,6 @@ Docker Desktop must be running before any deploy that rebuilds the image.
 **Created but unused:**
 - AgentCore Memory — `MEMORY_ID` is passed to the container and ignored
 - DynamoDB table — no code touches it
-
-**Built, awaiting deploy:**
-- API Gateway (Cognito authorizer, usage plan, throttling) and the Lambda BFF — Step 3
 
 **Not built:**
 - AgentCore Gateway with tool targets
@@ -152,10 +151,27 @@ body is not echoed — keep that property.
 
 ---
 
-## Step 3 — Entry layer: API Gateway + Lambda BFF — **BUILT, NOT YET DEPLOYED (2026-08-19)**
+## Step 3 — Entry layer: API Gateway + Lambda BFF — **DONE, VERIFIED IN THE CLOUD (2026-08-19)**
 
-Code and infrastructure are written, 17 new tests pass, `cdk diff` is clean. What is
-left is the deploy itself, which Jakub runs.
+Deployed and checked end to end. `./scripts/smoke.sh`:
+
+| Check | Result |
+|---|---|
+| Authorised call | `200` in 8.0 s, real forecast, `toolCalls: [get_weather]` |
+| No token | `401` |
+| Client-supplied `sessionId` | `200`, answered under the **derived** id, not the supplied one |
+| `photos` asked with a token lacking `photos:search` | `200`, agent declines honestly, `blocked: true` |
+
+The whole chain leaves one coherent trail: the `tool.authorize` / `blocked` span in the
+Runtime log group carries the same `sessionId` the BFF derived, so `Session → trace → span`
+holds across components rather than per component. The `bff.client_supplied_identity`
+span is in `/aws/lambda/travel-assistant-bff` — the attempt to supply a session id is on
+record, not silently dropped.
+
+**Two deploys, two lessons, both now in `CLAUDE.md`:** a new API key takes about a minute
+to propagate (a correct request returns `403 ForbiddenException` before that), and the
+Lambda bundle must be CJS because AWS SDK v3 is CJS internally. `npm run verify:bundle`
+now loads the synthesised artifact the way Lambda does, so the second one cannot repeat.
 
 **What was built**
 
@@ -196,10 +212,6 @@ left is the deploy itself, which Jakub runs.
 issued through the OAuth token endpoint — `USER_PASSWORD_AUTH` access tokens carry
 `aws.cognito.signin.user.admin` and nothing else — so a real per-human session needs a
 hosted-UI client with the authorization-code flow. Deferred; `curl` testing does not need it.
-
-**Verify after deploy:** `./scripts/smoke.sh` — an authorised call answers, the same call
-without a token returns 401, and a client-supplied `sessionId` comes back replaced by the
-derived one. Then confirm the BFF's spans in `/aws/lambda/travel-assistant-bff`.
 
 <details><summary>original notes</summary>
 
