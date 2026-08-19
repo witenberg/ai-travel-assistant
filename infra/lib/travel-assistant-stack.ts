@@ -218,7 +218,14 @@ export class TravelAssistantStack extends Stack {
         NODE_OPTIONS: '--enable-source-maps',
       },
       bundling: {
-        format: lambdaNode.OutputFormat.ESM,
+        // CJS, not ESM, and this cost a deploy. AWS SDK v3 is CJS internally; bundled
+        // into an ESM output it reaches `require("node:https")` at load time, which an
+        // ES module cannot do — the function died in INIT with
+        // `Dynamic require of "node:https" is not supported` and API Gateway reported a
+        // bare 502. The usual workaround is a `createRequire` banner, but that smuggles
+        // `require` back into an ES module to paper over the mismatch. Our source stays
+        // ESM; only the bundle esbuild emits is CJS, and nothing here needs top-level await.
+        format: lambdaNode.OutputFormat.CJS,
         target: 'node22',
         sourceMap: true,
         // Nothing is left external. The Node 22 runtime ships *some* of AWS SDK v3, but
