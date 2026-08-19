@@ -1,20 +1,29 @@
 {
     "permissions": {
         "allow": [
+            "Bash(./scripts/deploy.sh)",
+            "Bash(./scripts/destroy.sh)",
+            "Bash(./scripts/http-requests.sh)",
+            "Bash(./scripts/verify-bundle.sh)",
+            "Bash(./scripts/smoke.sh)",
+            "Bash(./scripts/smoke-gateway.sh)",
+            "Bash(./scripts/smoke-memory.sh)",
+            "Bash(./scripts/smoke-flights.sh)",
             "Bash(npx cdk deploy:*)",
             "Bash(npx cdk destroy:*)",
             "Bash(npx cdk diff:*)",
             "Bash(npx cdk synth:*)",
             "Bash(npm run:*)",
             "Bash(npm test:*)",
-            "Bash(./scripts/*.sh)",
             "Bash(aws cloudformation:*)",
             "Bash(aws logs:*)",
             "Bash(aws cognito-idp:*)",
             "Bash(aws apigateway:*)",
             "Bash(aws bedrock-agentcore:*)",
+            "Bash(aws sts get-caller-identity:*)",
             "Bash(aws secretsmanager put-secret-value:*)",
-            "Bash(python3 -m http.server:*)"
+            "Bash(python3 -m http.server:*)",
+            "mcp__claude-in-chrome"
         ]
     }
 }

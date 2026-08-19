@@ -1,12 +1,42 @@
 # Plan — user login and a minimal frontend
 
 **Status: not started.** Written 2026-08-19 to be executed by a session with no prior
-context, unattended, without asking Jakub anything. Read `CLAUDE.md` first, then this file
-top to bottom, then start at Phase 1.
+context, unattended. Read `CLAUDE.md` first, then this file top to bottom, then start at
+Phase 1.
 
-Jakub is out. **Do not stop to ask for approval.** Every decision that needed making is made
-below, with the reasoning, so that a disagreement can be recorded rather than escalated. If
-something is genuinely blocked, follow "If you get stuck" at the end.
+## Your authority — read this before anything else
+
+Jakub is out and has **granted this work in advance**. He asked for the login and a minimal
+frontend, approved the plan, and added the permission rules that let you deploy. So:
+
+**Do not ask him anything. Do not wait for confirmation. Do not stop at a decision point.**
+Every decision that needed making is made below, with its reasoning and its rejected
+alternatives — if you disagree with one, record the disagreement in the Progress log and
+implement the plan as written. He is not there to answer, and a half-finished feature with a
+question attached is worth less than a finished one with a note.
+
+You may, without checking in:
+
+- edit any file in this repository, including the CDK stack, and create `web/`
+- run `./scripts/deploy.sh` and `./scripts/destroy.sh` — as many times as the work needs
+- create the Cognito test user and set its password
+- drive Chrome to log in as that user and click through the page
+- commit and push to `origin main`, and let CI run
+- spend a few US cents on model calls (each browser turn is roughly one)
+
+You must **not**:
+
+- change or delete the machine (client-credentials) Cognito client, or anything the existing
+  smoke scripts depend on — the browser is an addition, not a replacement
+- remove `apiKeyRequired` from the API, or widen the API beyond `http://localhost:5173`
+- work around a permission denial — see below
+- leave the stack running. `./scripts/destroy.sh` is the last thing you do, pass or fail.
+
+**Verified before Jakub left:** `.claude/settings.json` carries 23 allow rules covering the
+wrappers, the AWS calls this plan makes, `python3 -m http.server`, and the Chrome tools. An
+exact-match script rule was tested and runs unprompted. If something is refused anyway, that is
+a decision and not an obstacle to route around: write the exact refused command into the
+Progress log, finish everything that does not depend on it, and stop there.
 
 ---
 
@@ -38,14 +68,8 @@ docker info >/dev/null && echo docker ok      # needed for the Runtime image
 cd /Users/jakub.wi/Desktop/ai_app && npm test # 174 must pass before you change anything
 ```
 
-**Deploy permission.** `cdk deploy` is normally blocked by the auto-mode classifier. Jakub added
-allow rules to `.claude/settings.json` before leaving. Check them:
-
-```bash
-cat .claude/settings.json
-```
-
-**Deploy and destroy through the wrappers, never by hand:**
+**Deploy and destroy through the wrappers, never by hand** — they are what the permission rules
+name, and they take no arguments:
 
 ```bash
 ./scripts/deploy.sh        # cdk diff, then cdk deploy --profile ai-playground
@@ -57,10 +81,8 @@ They exist because permission rules match on the prefix of the *whole* command s
 env-var assignment come first. One script is one exact string a rule can name. They also pin
 `--profile ai-playground`, because the default profile points at a corporate account.
 
-If a deploy is refused anyway: **do all the code work, commit it, run `cdk diff` and
-`npm run verify:bundle`, write into the "Progress log" below both what is left *and the exact
-command that was refused*, and stop.** Do not try to work around the classifier — a refusal is
-a decision, and Jakub can lift it in one line when he is back.
+A bare `npx cdk deploy` with a `cd` or an `AWS_PROFILE=` in front of it is **not** covered by the
+rules, because they match the prefix of the whole command string. Use the wrappers.
 
 ---
 

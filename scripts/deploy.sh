@@ -9,19 +9,20 @@
 # It also pins the profile with `--profile` instead of an environment variable, because
 # CLAUDE.md's first rule is that the default profile points at a corporate account.
 #
-#   ./scripts/deploy.sh            # diff, then deploy
-#   ./scripts/deploy.sh --no-diff  # skip the diff
+# Takes no arguments, deliberately: the permission rule that allows it is an exact string
+# match, so `./scripts/deploy.sh --anything` would not be covered by it. And the diff is not
+# optional in this project anyway.
+#
+#   ./scripts/deploy.sh
 set -euo pipefail
 
 PROFILE="${AWS_PROFILE:-ai-playground}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$HERE/infra"
 
-if [[ "${1:-}" != "--no-diff" ]]; then
-  echo "==> cdk diff (read it before the deploy — this is a project rule)"
-  npx cdk diff --profile "$PROFILE" || true
-  echo
-fi
+echo "==> cdk diff (read it before the deploy — this is a project rule)"
+npx cdk diff --profile "$PROFILE" || true
+echo
 
 echo "==> cdk deploy"
 npx cdk deploy --profile "$PROFILE" --require-approval never
