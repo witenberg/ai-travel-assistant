@@ -68,8 +68,8 @@ Do not re-add these steps.
 `node_modules/`, `dist/`, `cdk.out/` and `.env`; verified that `git ls-files | grep -c '\.env$'`
 returns 0, so the live Duffel token was never committed.
 
-**Still open:** no remote. Step 7 (CI/CD) needs one — GitHub is the assumption unless
-Jakub prefers otherwise.
+**Remote added 2026-08-19:** `git@github.com:witenberg/ai-travel-assistant.git`, private,
+`main` tracking `origin/main`. That closes the last open end here; CI lives in Step 7.
 
 <details><summary>original notes</summary>
 
@@ -463,19 +463,16 @@ run on a repository nobody has granted anything to yet.
   the six tests that call open-meteo, Wikipedia and Commons. They stay in `npm test` (161) and
   run locally; as a merge gate they would fail on someone else's outage.
 
-**What is left for Jakub — attaching the remote.** Nothing in the workflow needs configuring
-afterwards; Actions picks it up on the first push.
+**Verified on GitHub**, because a workflow that has never run is not a workflow that works:
+`witenberg/ai-travel-assistant`, first push to `main` — **green in 28 s**, and the second run
+after one fix green in 25 s. Fast enough that nobody will be tempted to skip it, which is the
+only property a gate needs beyond correctness.
 
-```bash
-cd /Users/jakub.wi/Desktop/ai_app
-gh repo create ai-travel-assistant --private --source=. --remote=origin --push
-# or, without gh:
-#   git remote add origin git@github.com:<user>/ai-travel-assistant.git
-#   git push -u origin main
-```
+The fix was worth having: the run annotated `actions/checkout@v4` and `actions/setup-node@v4`
+as targeting a deprecated Node 20, forced onto Node 24 by the runner. Both are pinned at `@v5`
+now. A deprecation warning on the first run is the cheapest one you will ever get.
 
-Then open a throwaway pull request to watch the gate run, because a workflow that has never
-run is not a workflow that works — same principle as the rest of this file.
+Nothing else needed configuring after the push — Actions picked the workflow up on its own.
 
 **Deliberately not done: deploying from CI.** It needs `sts:AssumeRole` on the CDK bootstrap
 roles, which only Paweł can grant (`docs/blocker-iam.md`), and on a 10 USD account with no

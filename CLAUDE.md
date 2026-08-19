@@ -430,7 +430,9 @@ extraction produced two correct preference records a few minutes later; see ROAD
 that one command himself with the `!` prefix. `synth`, `diff` and `destroy` go through
 normally. We show `cdk diff` before every deploy anyway.
 
-**CI:** `.github/workflows/ci.yml`, see ADR-0006. Run the same checks locally before pushing:
+**Repository:** `git@github.com:witenberg/ai-travel-assistant.git` (private), branch `main`.
+
+**CI:** `.github/workflows/ci.yml`, see ADR-0006. Green on GitHub in ~25 s per run. Run the same checks locally before pushing:
 `npm run typecheck && npm run test:offline && (cd infra && npx cdk synth --quiet) && npm run verify:bundle`.
 `npm test` (161) includes six tests that call open-meteo, Wikipedia and Commons;
 `npm run test:offline` (155) is the CI gate and skips them.
