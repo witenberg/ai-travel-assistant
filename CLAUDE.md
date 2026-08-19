@@ -257,6 +257,20 @@ or against `cdk synth`, not remembered.
   `credentialProviderType` required, `credentialProvider` optional. `cdk synth` cannot catch
   this: it is a service-side constraint on a field combination the CFN schema permits.
   General lesson: for AgentCore, trust `API_*.html` over a CLI-reference example.
+- **The Gateway supports exactly one MCP protocol version and rejects any other in the
+  header**: `2025-03-26`. It says so usefully —
+  `{"code":-32600,"message":"Unsupported protocol version: 2025-06-18","data":{"requested":...,"supported":["2025-03-26"]}}`.
+  Our client survived this without a change because it sends its preferred version to
+  `initialize` and then **adopts whatever the server answered with**; the smoke script, which
+  does no handshake and pinned `2025-06-18`, failed on the same run. Negotiate, do not pin.
+- **A REQUEST interceptor runs *before* the Gateway validates the protocol version.** Proved
+  by accident: on the run above, with a bad version header, a scope-*denied* `tools/call`
+  returned the interceptor's denial while a scope-*allowed* one returned the version error.
+  So a denial short-circuits the entire pipeline — and the interceptor must not assume it is
+  handed a request the Gateway has already found well-formed.
+- **`bedrockAgentCoreMcpMessageId` is the JSON-RPC id, a per-connection counter.** The first
+  deployed run logged `"sessionId": "4"`. It restarts at 1 for every conversation, so it is
+  useless as a correlation key and belongs in a span attribute, not as its id.
 - **The rest of the Gateway config was validated by that same failed deploy**, which is worth
   knowing: `Gateway` reached `CREATE_COMPLETE` before the target failed, so
   `authorizerType: CUSTOM_JWT`, the Cognito discovery URL, `allowedClients`, and the
@@ -330,6 +344,9 @@ guardrail that stays. We deploy through the CDK bootstrap roles (variant B in
 | Cognito | `us-east-1_WuhBjq1L7`, machine client `2499r5au4tmahnuon9daeruiid` |
 | Memory strategy | `travel_preferences-6n4o2nBeG6` (`USER_PREFERENCE`), namespace `/preferences/{actorId}` |
 | Log group | `/aws/bedrock-agentcore/runtimes/travel_assistant-m6PLoMGxv5-DEFAULT` |
+| Gateway | `travel-assistant-gateway-cxvsjwdkbj`, MCP endpoint `https://travel-assistant-gateway-cxvsjwdkbj.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp` |
+| Gateway target | `travel-tools` (id `ZO1C1YZ8PI`) — Lambda, three keyless tools |
+| Gateway Lambdas | `travel-assistant-gateway-interceptor`, `travel-assistant-gateway-tools` |
 | API | `https://ef1qmnowze.execute-api.us-east-1.amazonaws.com/v1/chat` |
 | Lambda BFF | `travel-assistant-bff`, log group `/aws/lambda/travel-assistant-bff` |
 | Usage plan | `travel-assistant-plan` — 2 rps, burst 5, 100 requests/day |
@@ -337,12 +354,14 @@ guardrail that stays. We deploy through the CDK bootstrap roles (variant B in
 Invoke it with `aws bedrock-agentcore invoke-agent-runtime`; the session id must be at
 least 33 characters. Payload is `{"prompt": "...", "scopes": [...]}` base64-encoded.
 
-**Built, not yet deployed (ROADMAP step 4):** AgentCore Gateway, its Lambda target and its
-REQUEST interceptor, plus the agent's MCP client. `cdk synth`, `npm run verify:bundle` and
-144 unit tests pass; `cdk diff` shows 11 new resources and the Runtime updated in place.
-Verify with `./scripts/smoke-gateway.sh` after the deploy — it speaks MCP to the Gateway
-directly first, with no agent in the path, because that is the only way to tell whether a
-refusal came from the Gateway or from our own code.
+**AgentCore Gateway is deployed and verified (ADR-0004, ROADMAP step 4).** The three keyless
+tools are served over MCP by a Gateway Lambda target, and a REQUEST interceptor enforces
+scopes per tool call. Verified with `./scripts/smoke-gateway.sh`: `tools/list` returns the
+three tools prefixed `travel-tools___`, a scope-granted `get_weather` returns a real
+forecast, a scope-denied `get_photos` comes back `blocked: true` **with no agent in the
+request**, both decisions appear as spans in the interceptor's log group carrying the
+session id, and the end-to-end turn answered with the forecast plus an honest refusal about
+photos in 8.3 s.
 
 **Still a placeholder:** the Duffel secret holds `REPLACE_ME`, and the tool does not yet
 read from the Identity token vault, so `search_flights` fails in the cloud. The other

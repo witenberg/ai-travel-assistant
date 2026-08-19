@@ -50,13 +50,21 @@ ACCESS_TOKEN=$(curl -sS -X POST "$TOKEN_ENDPOINT" \
   --data-urlencode 'grant_type=client_credentials' \
   --data-urlencode "scope=$SCOPES" | json '["access_token"]')
 
+# The Gateway accepts one protocol version and says so plainly when you get it wrong:
+#   {"error":{"code":-32600,"message":"Unsupported protocol version: 2025-06-18",
+#             "data":{"requested":"2025-06-18","supported":["2025-03-26"]}}}
+# This script pins it because it does no handshake. The agent's client does not pin it: it
+# sends its preferred version to `initialize` and then adopts whatever the server answered
+# with, which is why the agent kept working on the run where these curl calls failed.
+PROTOCOL_VERSION="${PROTOCOL_VERSION:-2025-03-26}"
+
 # One helper for every JSON-RPC call, so the request shape is identical to the agent's.
 mcp() {
   curl -sS -X POST "$GATEWAY_URL" \
     -H "authorization: Bearer $ACCESS_TOKEN" \
     -H 'content-type: application/json' \
     -H 'accept: application/json, text/event-stream' \
-    -H 'mcp-protocol-version: 2025-06-18' \
+    -H "mcp-protocol-version: $PROTOCOL_VERSION" \
     -H 'x-travel-session-id: smoke-gateway-session' \
     -d "$1"
 }

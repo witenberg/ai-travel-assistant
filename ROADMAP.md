@@ -40,6 +40,8 @@ Docker Desktop must be running before any deploy that rebuilds the image.
   Lambda BFF — deployed and verified, see Step 3
 - Memory: short-term history — deployed and verified in the cloud, see Step 5.
   Long-term preference extraction is built and live but has produced no records yet
+- AgentCore Gateway: the three keyless tools served over MCP by a Lambda target, with a
+  REQUEST interceptor enforcing scopes per tool call — deployed and verified, see Step 4
 - `Session → trace → span` reaching CloudWatch from the deployed Runtime
 - One CDK stack: Cognito, DynamoDB, Secrets Manager, Identity credential provider,
   Memory, Runtime, log group
@@ -50,10 +52,6 @@ Docker Desktop must be running before any deploy that rebuilds the image.
 
 **Created but unused:**
 - DynamoDB table — no code touches it (step 6 decides its fate)
-
-**Built, not yet deployed:**
-- AgentCore Gateway, its Lambda target and its REQUEST interceptor, and the agent's MCP
-  client — see Step 4
 
 **Not built:**
 - CI/CD
@@ -209,52 +207,70 @@ token returns 401; a client-supplied `sessionId` in the body is ignored.
 
 ---
 
-## Step 4 — AgentCore Gateway — **BUILT, NOT YET DEPLOYED (2026-08-19)**
+## Step 4 — AgentCore Gateway — **DONE, VERIFIED IN THE CLOUD (2026-08-19)**
 
 Design and rejected alternatives: [ADR-0004](docs/adr/0004-tools-behind-the-gateway.md).
 **The largest step, and the one closest to the project's purpose** — everything before it
 used Runtime, Identity, Memory and Observability; the Gateway is the remaining major
 AgentCore capability, and it is what the FigJam diagram actually draws.
 
-**First deploy attempt failed and rolled back cleanly (2026-08-19).** One field:
-`credentialProviderConfigurations` on a Lambda target must be the bare type
-`GATEWAY_IAM_ROLE` with **no** `credentialProvider` object — the CLI reference's own
-Lambda-target example is wrong about this, and `cdk synth` cannot catch it because the CFN
-schema permits the combination. Fixed; the lesson is in `CLAUDE.md`.
+Deployed in 80 s on the second attempt. `./scripts/smoke-gateway.sh`:
 
-What that failure did establish, before it got there: the `Gateway` resource itself reached
-`CREATE_COMPLETE`, so `CUSTOM_JWT`, the Cognito discovery URL, `allowedClients` and the
-`REQUEST` interceptor with `passRequestHeaders: true` are all accepted as written. The
+| Check | Result |
+|---|---|
+| `tools/list` over MCP, no agent in the path | three tools: `travel-tools___get_photos` / `_get_place_details` / `_get_weather`, with the schemas generated from the tools |
+| `tools/call get_weather`, scope granted | real forecast, `"weekday":"Saturday"` computed by the tool |
+| `tools/call get_photos`, scope **not** granted | `isError: true`, `{"error":"Missing scope \"photos:search\"...","blocked":true}` |
+| Denial trace | `gateway.authorize` span, status `blocked`, carrying `requiredScope`, `grantedScopes` and `clientId` |
+| Session survives the Gateway hop | those spans carry `sessionId` `7e6cb662…` — the id the BFF derived |
+| The tool really ran in the target Lambda | `gateway.tool.execute`, `get_weather`, `ok`, 2794 ms, with `gatewayId` and `targetId` |
+| End to end through the API | `200` in 8.3 s, `toolCalls: [{get_photos, blocked: true}, {get_weather, blocked: false}]`, forecast given and photos honestly refused |
+
+The third row is the one that matters: there is no agent in that request, so the refusal can
+only be AgentCore's. Before this step the same denial was produced by our own code, inside
+the component being restricted.
+
+**Two deploys, and the first one earned its keep.** It failed on a single field —
+`credentialProviderConfigurations` on a Lambda target must be the bare type
+`GATEWAY_IAM_ROLE` with **no** `credentialProvider` object, contradicting the CLI reference's
+own Lambda-target example — and `cdk synth` cannot catch it, because the CloudFormation
+schema permits the combination. It also proved the rest: `Gateway` reached `CREATE_COMPLETE`
+before the target failed, so `CUSTOM_JWT`, the discovery URL, `allowedClients` and the
+`REQUEST` interceptor with `passRequestHeaders: true` were all correct as written. The
 rollback removed every gateway resource and left the stack as it was.
 
-**Ready to deploy again.** `cdk diff` shows 11 new resources and the Runtime updated in place:
+**Three findings from the running system**, all now in `CLAUDE.md`:
 
-| | |
-|---|---|
-| New | `GatewayRole`, `GatewayInterceptor` + log group, `GatewayToolTarget` + log group, `Gateway`, `GatewayLogs`, `ToolTarget`, three IAM roles/policies |
-| Changed | `Runtime` — gains `GATEWAY_URL`, a dependency on `ToolTarget`, and a new image |
-| Checks that passed | 144 unit tests, `tsc --noEmit` in both trees, `cdk synth` with no warnings, `npm run verify:bundle` over all three Lambda bundles |
+- the Gateway accepts only MCP `2025-03-26` and rejects anything else in the header, with a
+  helpful error naming what it supports. Our client was unaffected because it sends its
+  preferred version to `initialize` and then **adopts the server's answer**; the smoke
+  script, which pinned `2025-06-18` and does no handshake, failed on the same run.
+  Negotiating was a guess when it was written and paid off on first contact.
+- a REQUEST interceptor runs **before** protocol-version validation, so a denial
+  short-circuits the whole pipeline — and the interceptor must not assume it was handed a
+  request the Gateway already found well-formed.
+- `bedrockAgentCoreMcpMessageId` is the JSON-RPC id: a per-connection counter that restarts
+  at 1, so the first run logged `"sessionId": "4"`. Now the Lambda request id is the
+  correlation id and the message id is demoted to an attribute.
 
-Docker Desktop must be running — the container image is rebuilt.
+**One redeploy outstanding:** that last fix is committed and not deployed, so the target
+Lambda in the cloud still labels its spans with the message id. Harmless, and it goes out
+with whatever Step 2 changes next.
 
-**Deploy:** `cd infra && npx cdk deploy --require-approval never` (Jakub runs this himself,
-prefixed with `!`).
-
-**Then verify:** `./scripts/smoke-gateway.sh`. It asks Cognito for a token with
+**Re-verify any time:** `./scripts/smoke-gateway.sh`. It asks Cognito for a token with
 `tools/weather:read tools/places:read` and deliberately **not** `tools/photos:search`, then:
 
-1. speaks MCP to the Gateway **directly, with no agent in the path** — `tools/list` must
-   return three tools named `travel-tools___*`. This is first on purpose and costs no model
-   tokens: when a tool call is refused, removing our own code from the request is the only
-   way to know who refused it.
-2. `tools/call travel-tools___get_weather` — must return a real forecast.
-3. `tools/call travel-tools___get_photos` — must come back `isError` with `blocked: true`.
-   There is no agent in that request, so the refusal can only be the interceptor's.
-4. reads `/aws/lambda/travel-assistant-gateway-interceptor` for a `gateway.authorize` span
-   with status `blocked` — the diagram's denial trace, now written by the component that
-   actually made the decision.
-5. asks the agent for photos *and* weather through the API — expect the forecast plus an
-   honest refusal about photos, and `toolCalls` showing `get_photos` blocked.
+1. speaks MCP to the Gateway **directly, with no agent in the path**. This is first on
+   purpose and costs no model tokens: when a tool call is refused, removing our own code from
+   the request is the only way to know who refused it.
+2. calls `get_weather`, which must return a real forecast.
+3. calls `get_photos`, which must come back `isError` with `blocked: true`.
+4. reads `/aws/lambda/travel-assistant-gateway-interceptor` for the `gateway.authorize` spans.
+5. asks the agent for photos *and* weather through the API.
+
+Note on step 4 of that script: log delivery lags a few seconds behind the call. An empty
+result immediately after a request means the log has not arrived, not that nothing ran — the
+same shape of mistake as reading an empty `retrieve-memory-records` as a broken strategy.
 
 **What was built**
 

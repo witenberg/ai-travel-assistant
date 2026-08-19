@@ -37,14 +37,20 @@ export function createToolTargetHandler(tools: readonly Tool[] = GATEWAY_TOOLS) 
     const advertisedName = custom.bedrockAgentCoreToolName;
 
     /*
-     * The correlation id here is the Gateway's request id, **not** our runtime session id.
+     * The correlation id is this invocation's own request id, **not** our runtime session id.
      * AgentCore does not forward the caller's `Mcp-Session-Id` to a Lambda target — the
      * target receives only the tool arguments and the ids below — so the
      * Session -> trace -> span chain cannot be continued from inside this function.
-     * The interceptor can, because it sees the request headers; correlate a tool
-     * execution to a session through the interceptor's span for the same message id.
+     * Correlate a tool execution to a conversation through the interceptor's span instead;
+     * the interceptor can carry the session id because it sees the request headers.
+     *
+     * `bedrockAgentCoreMcpMessageId` deliberately is *not* used for this, and the first
+     * deployed run is why: it logged `"sessionId": "4"`. The MCP message id is the
+     * JSON-RPC id, a per-connection counter that restarts at 1 for every conversation — so
+     * as a correlation key it is worse than useless, because two unrelated turns collide on
+     * the same value. It is kept as an attribute, where a low-cardinality number is honest.
      */
-    const trace = new Trace(custom.bedrockAgentCoreMcpMessageId ?? context.awsRequestId ?? 'unknown');
+    const trace = new Trace(context.awsRequestId ?? custom.bedrockAgentCoreAwsRequestId ?? 'unknown');
     const attributes = {
       gatewayId: custom.bedrockAgentCoreGatewayId,
       targetId: custom.bedrockAgentCoreTargetId,
