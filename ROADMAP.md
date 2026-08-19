@@ -507,6 +507,20 @@ bytes. The agent's turn answered with the forecast and refused photos honestly.
 
 ---
 
+## Step 10 — User login and a minimal frontend — **PLANNED, not started**
+
+Full plan, written to be executed unattended by a session with no prior context:
+[`docs/plan-login-frontend.md`](docs/plan-login-frontend.md). It closes the board's
+`login (OIDC)` edge — today the only Cognito client is machine-to-machine, so `sub` is an app
+client id and every caller shares one session and one long-term memory. The per-user code is
+already written and tested; what is missing is a human in front of Cognito.
+
+Ten decisions are settled in the plan so the executing session needs to ask nothing. The
+prerequisite it cannot supply itself: `cdk deploy` is blocked by the auto-mode classifier, so
+`.claude/settings.json` must carry the allow rules before it starts.
+
+---
+
 ## Step 8 — Deeper observability (optional)
 
 - CloudWatch Transaction Search plus ADOT gives the CloudWatch GenAI dashboard, service
