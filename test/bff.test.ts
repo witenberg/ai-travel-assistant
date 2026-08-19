@@ -236,3 +236,37 @@ describe('request handling', () => {
     assert.ok(!res.body.includes(SUB));
   });
 });
+
+/*
+ * The browser harness in `web/` reads these responses cross-origin. API Gateway's preflight
+ * answers the `OPTIONS` request but says nothing about what this function returns, so a
+ * missing header here turns every error into an opaque "CORS error" in the console with the
+ * status and the JSON body hidden — the failures worth debugging are exactly the ones that
+ * would disappear. Hence: the header on every path, not just on the 200.
+ */
+describe('cross-origin responses', () => {
+  test('the answer carries an allow-origin header', async () => {
+    const res = await invoke({ prompt: 'hi' });
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.headers['access-control-allow-origin'], '*');
+  });
+
+  test('every refusal and failure carries it too, or the browser hides the reason', async () => {
+    const refusals = [
+      await invoke({}),                                        // 400, no prompt
+      await invoke('{ not json'),                              // 400, bad body
+      await handler({ body: '{}', requestContext: { authorizer: { claims: {} } } }), // 401
+      await invoke({ prompt: 'hi' }, {}, {}),                  // 401, no bearer
+      await invoke({ prompt: 'hi' }, { scope: 'openid' }),     // 403, no tool scopes
+    ];
+    for (const res of refusals) {
+      assert.ok(res.statusCode >= 400, `expected a refusal, got ${res.statusCode}`);
+      assert.equal(res.headers['access-control-allow-origin'], '*');
+    }
+
+    nextError = new Error('runtime unavailable');
+    const upstream = await invoke({ prompt: 'hi' });
+    assert.equal(upstream.statusCode, 502);
+    assert.equal(upstream.headers['access-control-allow-origin'], '*');
+  });
+});

@@ -80,10 +80,27 @@ export function deriveActorId(sub: string): string {
   return `u-${createHash('sha256').update(`travel-assistant-actor:${sub}`).digest('hex')}`;
 }
 
+/*
+ * Every response, not just the happy path.
+ *
+ * API Gateway's CORS preflight covers the `OPTIONS` request; it does not touch what this
+ * function returns. A 403 without `access-control-allow-origin` is reported by the browser
+ * as a CORS failure with the status and the body hidden, so the one diagnostic the caller
+ * needs is exactly the one that gets swallowed — which is why the header belongs here and
+ * not only on the 200.
+ *
+ * `*` rather than the single origin the API's preflight allows: this response carries no
+ * cookie and no credential, so a reader learns nothing they did not already have to hold a
+ * token to fetch, and pinning it would mean this function knowing about the harness's port.
+ * A deployment with a real frontend would echo an allow-list instead.
+ */
 function respond(statusCode: number, body: unknown): ProxyResult {
   return {
     statusCode,
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      'access-control-allow-origin': '*',
+    },
     body: JSON.stringify(body),
   };
 }

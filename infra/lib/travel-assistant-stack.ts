@@ -72,6 +72,50 @@ export class TravelAssistantStack extends Stack {
     });
 
     /*
+     * Browser client: a human logs in through the Cognito hosted UI — ADR-0007.
+     *
+     * A second client rather than a change to the one above, because the two authenticate
+     * two different kinds of caller. Client-credentials has no user and therefore no `sub`
+     * that means a person; the authorization-code flow has one, and that `sub` is what
+     * `deriveSessionId`/`deriveActorId` have been waiting for. Widening the machine client
+     * to do both would also have traded a working smoke path for a new feature.
+     *
+     * `generateSecret: false` is not a shortcut: a secret shipped inside a page is not a
+     * secret. Public client + PKCE is the flow Cognito provides for exactly this, and the
+     * code verifier gives the token exchange the proof of possession the secret used to.
+     */
+    const webClient = userPool.addClient('WebClient', {
+      generateSecret: false,
+      /*
+       * Every explicit auth flow stays off, and USER_PASSWORD_AUTH is the one that matters:
+       * a token minted through it carries `aws.cognito.signin.user.admin` and **no custom
+       * scopes at all**. Allowing it would create a second, easier login path whose tokens
+       * pass API Gateway's authorizer and are then refused by every tool at the Gateway —
+       * a silent failure that looks like a broken agent, not like a misconfigured client.
+       */
+      authFlows: { userPassword: false },
+      oAuth: {
+        flows: { authorizationCodeGrant: true },
+        scopes: TOOL_SCOPES.map((s) =>
+          cognito.OAuthScope.resourceServer(resourceServer, new cognito.ResourceServerScope({
+            scopeName: s, scopeDescription: `Allows ${s}`,
+          })),
+        ),
+        // Exact match, trailing slash included — Cognito compares these as strings, and a
+        // missing slash fails at the hosted UI with an error page that names nothing useful.
+        // `http://localhost` is the only non-TLS origin Cognito accepts, which is also why
+        // the frontend is served from a local port rather than from S3.
+        callbackUrls: ['http://localhost:5173/'],
+        logoutUrls: ['http://localhost:5173/'],
+      },
+      // An hour is the shortest life that survives a manual verification session. There is
+      // deliberately no refresh handling in the page (ADR-0007): on a 401 you log in again.
+      accessTokenValidity: Duration.hours(1),
+      idTokenValidity: Duration.hours(1),
+      refreshTokenValidity: Duration.days(1),
+    });
+
+    /*
      * No application data store, and that is a decision — ADR-0005.
      *
      * The FigJam diagram draws a DynamoDB table for "app data", and this stack carried one
@@ -408,7 +452,11 @@ export class TravelAssistantStack extends Stack {
           // `allowedClients`, not `allowedAudience`: a Cognito client-credentials access
           // token carries `client_id` and no `aud` claim, so an audience check would reject
           // every token our machine client issues.
-          allowedClients: [machineClient.userPoolClientId],
+          // Both clients, and the second one is the single most likely thing to be
+          // forgotten here: a browser token the API Gateway authorizer happily accepts is
+          // still rejected at the Gateway if its `client_id` is not on this list, and the
+          // symptom is every tool call failing with the agent looking broken.
+          allowedClients: [machineClient.userPoolClientId, webClient.userPoolClientId],
           // No `allowedScopes` here on purpose. That field is a gateway-wide gate — one
           // scope for every tool — and what we need is per-tool, which is the interceptor's job.
         },
@@ -544,12 +592,51 @@ export class TravelAssistantStack extends Stack {
     // is considered deployed — otherwise the first invocation after a deploy fails on an
     // empty catalogue and looks like a broken agent.
     runtime.addResourceDependency(toolsTarget);
+    /*
+     * And on the role's *policy*, not just the role — a deploy paid for this one.
+     *
+     * `roleArn` gives CloudFormation a dependency on the role, so the role exists first. It
+     * says nothing about the inline policy CDK generates from `addToPolicy`/`grantPull`, which
+     * is a separate `AWS::IAM::Policy` resource and therefore free to be created in parallel
+     * with the runtime. AgentCore validates the ECR URI *as the execution role* at create
+     * time, so losing that race fails the whole stack with a message that reads like a missing
+     * permission rather than a missing ordering:
+     *
+     *   Access denied while validating ECR URI ... The execution role requires permissions
+     *   for ecr:GetAuthorizationToken, ecr:BatchGetImage, and ecr:GetDownloadUrlForLayer
+     *
+     * — while the very next event says `RuntimeRoleDefaultPolicy ... Resource creation
+     * cancelled`, which is the actual story. `node.addDependency` on the construct covers
+     * every resource in its subtree, the generated policy included; a
+     * `addResourceDependency(runtimeRole.node.defaultChild)` would not.
+     */
+    runtime.node.addDependency(runtimeRole);
 
-    // AgentCore writes to /aws/bedrock-agentcore/runtimes/<agentRuntimeId>-<endpointName>.
-    // We declare it ourselves rather than let AgentCore auto-create it, for two reasons:
-    // an auto-created group never expires, and it would survive `cdk destroy`.
-    // The name depends on the runtime id, so this resource is created after the runtime.
-    new logs.LogGroup(this, 'AgentLogs', {
+    /*
+     * AgentCore writes to /aws/bedrock-agentcore/runtimes/<agentRuntimeId>-<endpointName>.
+     * We want two things from that group that AgentCore will not give us — an expiry, and
+     * deletion on `cdk destroy` — but we cannot *own* it, and that distinction cost a deploy.
+     *
+     * `new logs.LogGroup` was the obvious way to say it and is unbuildable: the group's name
+     * contains the runtime id, so it can only be created after the runtime exists, and the
+     * runtime's role holds `logs:CreateLogGroup` precisely so AgentCore can create the group
+     * itself. Measured: AgentCore created it 3 s after the runtime, CloudFormation reached the
+     * `AWS::Logs::LogGroup` a second later and failed the stack with `already exists`. The two
+     * requirements are in direct conflict — a resource CloudFormation creates cannot also be
+     * a resource something else creates first.
+     *
+     * (This only became visible once the runtime was ordered after its role's policy, above.
+     * Before that the role had no `logs:CreateLogGroup` when the runtime started, so AgentCore
+     * silently could not create the group and CloudFormation won the race by default — the
+     * deploy that "worked" was one whose observability was broken for the same reason.)
+     *
+     * `LogRetention` is the construct for a group somebody else owns: its custom resource
+     * creates the group only if it is missing, then sets the retention, and with
+     * `removalPolicy: DESTROY` deletes it on teardown. Same two guarantees, no ownership claim.
+     * The Gateway's group needs none of this — it is created lazily on the first request, long
+     * after CloudFormation is done.
+     */
+    new logs.LogRetention(this, 'AgentLogs', {
       logGroupName: `/aws/bedrock-agentcore/runtimes/${runtime.attrAgentRuntimeId}-DEFAULT`,
       retention: logs.RetentionDays.ONE_WEEK,
       removalPolicy: RemovalPolicy.DESTROY,
@@ -654,7 +741,26 @@ export class TravelAssistantStack extends Stack {
       authorizerName: 'travel-assistant-jwt',
     });
 
-    const chat = api.root.addResource('chat');
+    /*
+     * CORS, for the localhost harness in `web/` — ADR-0007.
+     *
+     * A browser will not send the real POST at all until a preflight `OPTIONS` on the same
+     * path answers with a matching origin, so this is not decoration: without it the page
+     * fails before the token is ever used. CDK's mock integration answers the preflight
+     * with `authorizationType: NONE` and no API key, which is required rather than lax —
+     * a preflight carries neither header, so demanding them would refuse every request
+     * before the authorizer ever saw a token.
+     *
+     * The origin list is exactly one entry on purpose. `*` would let any page a logged-in
+     * user visits spend this API's daily quota with their token.
+     */
+    const chat = api.root.addResource('chat', {
+      defaultCorsPreflightOptions: {
+        allowOrigins: ['http://localhost:5173'],
+        allowHeaders: ['authorization', 'content-type', 'x-api-key'],
+        allowMethods: ['POST', 'OPTIONS'],
+      },
+    });
     chat.addMethod('POST', new apigw.LambdaIntegration(bff, { proxy: true }), {
       authorizer,
       authorizationType: apigw.AuthorizationType.COGNITO,
@@ -665,6 +771,49 @@ export class TravelAssistantStack extends Stack {
       // plan — that is the only way to attach a daily quota in API Gateway.
       apiKeyRequired: true,
     });
+
+    /*
+     * CORS on API Gateway's *own* refusals, which is a different thing from the two CORS
+     * mechanisms above and was missed by both.
+     *
+     * `defaultCorsPreflightOptions` handles the `OPTIONS` request; `respond()` in the BFF
+     * handles what our code returns. Neither touches a response API Gateway generates before
+     * the integration runs — an expired or missing token (`UNAUTHORIZED`), a bad API key, a
+     * throttle. Measured with curl: such a 401 arrives with no `access-control-allow-origin` at
+     * all, so in a browser `fetch` rejects outright and the status is unreadable.
+     *
+     * That is not an edge case in this design: access tokens last an hour and there is no
+     * refresh handling (ADR-0007), so "the token expired" is the *expected* end of every
+     * session — and it is exactly the response the page must be able to read in order to show
+     * the login button again. Without this, the harness's one recovery path is unreachable and
+     * an hour-old page reports a CORS error instead.
+     *
+     * DEFAULT_4XX/DEFAULT_5XX rather than naming `UNAUTHORIZED`: API Gateway applies the
+     * defaults to every response type not customised individually, so this also covers the
+     * quota and throttle refusals that are the budget controls, and cannot silently miss a
+     * type we did not think of.
+     */
+    for (const [id, type] of [
+      ['Default4xxCors', apigw.ResponseType.DEFAULT_4XX],
+      ['Default5xxCors', apigw.ResponseType.DEFAULT_5XX],
+    ] as const) {
+      const response = api.addGatewayResponse(id, {
+        type,
+        // Single quotes are required: API Gateway reads this as a mapping expression, and an
+        // unquoted `*` is parsed as a reference to something rather than as a literal.
+        responseHeaders: { 'Access-Control-Allow-Origin': "'*'" },
+      });
+      /*
+       * And the stage deployment must be created *after* it — CDK does not infer this, and it
+       * cost a diagnostic. On the deploy that added these, both `GatewayResponse` resources
+       * reached CREATE_COMPLETE twelve seconds before the new `Deployment`, the deployment's
+       * hash did change, and the header still did not appear on a 401 forty seconds later. One
+       * `create-deployment` by hand fixed it immediately. So a gateway response only takes
+       * effect through a deployment that observes it, and "CloudFormation created it" is not
+       * the same as "the stage serves it" — the same shape as `READY` not meaning it works.
+       */
+      api.latestDeployment?.node.addDependency(response);
+    }
 
     const apiKey = api.addApiKey('DefaultKey', { apiKeyName: 'travel-assistant-key' });
     const plan = api.addUsagePlan('DefaultPlan', {
@@ -691,5 +840,7 @@ export class TravelAssistantStack extends Stack {
     new CfnOutput(this, 'ApiKeyId', { value: apiKey.keyId });
     new CfnOutput(this, 'GatewayUrl', { value: gateway.attrGatewayUrl });
     new CfnOutput(this, 'GatewayId', { value: gateway.attrGatewayIdentifier });
+    new CfnOutput(this, 'WebClientId', { value: webClient.userPoolClientId });
+    new CfnOutput(this, 'HostedUiDomain', { value: userPoolDomain.baseUrl() });
   }
 }
