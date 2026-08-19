@@ -248,10 +248,20 @@ or against `cdk synth`, not remembered.
   no session id to a target or an interceptor. The interceptor gets ours back because the
   MCP client sends `x-travel-session-id`; the **target Lambda cannot**, so a tool-execution
   span correlates through the interceptor's span for the same MCP message id.
-- **A Lambda target's credential config is `GATEWAY_IAM_ROLE`** with
-  `iamCredentialProvider: { service: 'lambda', region }`. The other types (`OAUTH`,
-  `API_KEY`, `CALLER_IAM_CREDENTIALS`, `JWT_PASSTHROUGH`) are for targets needing an
-  outbound credential injected.
+- **A Lambda target's credential config is the bare type `GATEWAY_IAM_ROLE` with no
+  `credentialProvider` object** — and this one cost a deploy. Adding
+  `iamCredentialProvider: { service: 'lambda', region }`, which the **CLI reference shows in
+  its own Lambda-target example**, is rejected at create time: *"IamCredentialProvider is not
+  supported for this target type. Only MCP Server, OpenAPI, and Passthrough targets can
+  configure IamCredentialProvider."* The API reference is the source that is right —
+  `credentialProviderType` required, `credentialProvider` optional. `cdk synth` cannot catch
+  this: it is a service-side constraint on a field combination the CFN schema permits.
+  General lesson: for AgentCore, trust `API_*.html` over a CLI-reference example.
+- **The rest of the Gateway config was validated by that same failed deploy**, which is worth
+  knowing: `Gateway` reached `CREATE_COMPLETE` before the target failed, so
+  `authorizerType: CUSTOM_JWT`, the Cognito discovery URL, `allowedClients`, and the
+  `REQUEST` interceptor with `passRequestHeaders` are all accepted as written. A rollback is
+  not only a loss — it tells you which half of the change was right.
 - **`allowedClients`, not `allowedAudience`, for Cognito machine tokens.** A
   client-credentials access token carries `client_id` and no `aud`, so an audience check
   rejects every token our machine client issues.

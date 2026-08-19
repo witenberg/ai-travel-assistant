@@ -216,7 +216,18 @@ Design and rejected alternatives: [ADR-0004](docs/adr/0004-tools-behind-the-gate
 used Runtime, Identity, Memory and Observability; the Gateway is the remaining major
 AgentCore capability, and it is what the FigJam diagram actually draws.
 
-**Ready to deploy.** `cdk diff` shows 11 new resources and the Runtime updated in place:
+**First deploy attempt failed and rolled back cleanly (2026-08-19).** One field:
+`credentialProviderConfigurations` on a Lambda target must be the bare type
+`GATEWAY_IAM_ROLE` with **no** `credentialProvider` object — the CLI reference's own
+Lambda-target example is wrong about this, and `cdk synth` cannot catch it because the CFN
+schema permits the combination. Fixed; the lesson is in `CLAUDE.md`.
+
+What that failure did establish, before it got there: the `Gateway` resource itself reached
+`CREATE_COMPLETE`, so `CUSTOM_JWT`, the Cognito discovery URL, `allowedClients` and the
+`REQUEST` interceptor with `passRequestHeaders: true` are all accepted as written. The
+rollback removed every gateway resource and left the stack as it was.
+
+**Ready to deploy again.** `cdk diff` shows 11 new resources and the Runtime updated in place:
 
 | | |
 |---|---|

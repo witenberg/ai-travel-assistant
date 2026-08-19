@@ -382,13 +382,20 @@ export class TravelAssistantStack extends Stack {
           },
         },
       },
-      // The Gateway signs the Lambda invocation with its own role. The alternative types
-      // (OAUTH, API_KEY) are for targets that need an outbound credential injected — which
-      // is what `search_flights` would need, and the reason it is not here (ADR-0002).
-      credentialProviderConfigurations: [{
-        credentialProviderType: 'GATEWAY_IAM_ROLE',
-        credentialProvider: { iamCredentialProvider: { service: 'lambda', region: this.region } },
-      }],
+      /*
+       * The Gateway signs the Lambda invocation with its own role. The alternative types
+       * (OAUTH, API_KEY) are for targets that need an outbound credential injected — which is
+       * what `search_flights` would need, and the reason it is not here (ADR-0002).
+       *
+       * The *type alone*, with no `credentialProvider` object. This cost a deploy: adding
+       * `iamCredentialProvider: { service: 'lambda', region }` — which the CLI reference
+       * shows in its Lambda-target example — is rejected at create time with
+       * "IamCredentialProvider is not supported for this target type. Only MCP Server,
+       * OpenAPI, and Passthrough targets can configure IamCredentialProvider." The API
+       * reference is the trustworthy source here: `credentialProviderType` is required and
+       * `credentialProvider` is optional.
+       */
+      credentialProviderConfigurations: [{ credentialProviderType: 'GATEWAY_IAM_ROLE' }],
     });
     toolsTarget.addResourceDependency(gateway);
 
