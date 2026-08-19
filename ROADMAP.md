@@ -1,0 +1,245 @@
+# Roadmap
+
+Written 2026-08-19 so work can continue in a fresh session with no prior context.
+Read [`CLAUDE.md`](CLAUDE.md) first — it holds the architecture, the budget rules, the
+language rule and the AgentCore lessons. This file holds only *what is left to do*.
+
+---
+
+## Resuming in a fresh session
+
+```bash
+aws sso login --sso-session perpaul          # SSO tokens expire; do this first
+export AWS_PROFILE=ai-playground             # NEVER rely on the default profile
+
+aws sts get-caller-identity                  # must show 687222805898 (mb-demos)
+aws cloudformation describe-stacks --stack-name TravelAssistantStack \
+  --query 'Stacks[0].StackStatus' --output text     # or "does not exist" if destroyed
+
+cd /Users/jakub.wi/Desktop/ai_app
+npm test && npm run typecheck                # 35 tests must pass
+```
+
+If the stack is gone, redeploy takes ~3 minutes:
+`cd infra && npx cdk deploy --require-approval never` (Jakub must run this himself,
+prefixed with `!` — the auto-mode classifier blocks `cdk deploy`).
+
+Docker Desktop must be running before any deploy that rebuilds the image.
+
+---
+
+## Where things stand
+
+**Works, verified end to end:**
+- Agent loop (Bedrock Converse + tool use) locally and inside AgentCore Runtime
+- Three tools: `get_place_details` (Wikipedia), `get_weather` (open-meteo),
+  `get_photos` (Wikimedia Commons)
+- Scope enforcement locally via `src/guard.ts`, with a `blocked` span
+- `Session → trace → span` reaching CloudWatch from the deployed Runtime
+- One CDK stack: Cognito, DynamoDB, Secrets Manager, Identity credential provider,
+  Memory, Runtime, log group
+
+**Built but not working in the cloud:**
+- `search_flights` (Duffel). The secret still holds `REPLACE_ME` and the tool reads
+  `DUFFEL_ACCESS_TOKEN` from the environment instead of the Identity token vault.
+
+**Created but unused:**
+- AgentCore Memory — `MEMORY_ID` is passed to the container and ignored
+- DynamoDB table — no code touches it
+
+**Not built:**
+- API Gateway, Lambda BFF, AgentCore Gateway with tool targets
+- Version control, CI/CD
+
+---
+
+## Step 0 — Version control
+
+**Why first:** the project has no git repository at all. The mentoring goal explicitly
+includes the whole SDLC, and every later step (CI/CD, review, ADR history) assumes one.
+It is also the cheapest possible step.
+
+- `git init`, commit the current tree
+- Confirm `.gitignore` covers `node_modules/`, `dist/`, `cdk.out/`, `.env`
+- **Check that `.env` is not committed** — it holds a live Duffel token
+- Decide whether a remote is wanted (needed for Step 7)
+
+**Verify:** `git status` clean, `git log` has one commit, `git ls-files | grep -c '\.env$'`
+returns 0.
+
+---
+
+## Step 1 — Budget guardrail
+
+**Why:** the account cap is 10 USD and nothing currently warns us. Every other step
+spends money. This is the only step that protects the others.
+
+- AWS Budgets: a cost budget at 5 USD with an email alert, plus a forecast alert
+- Consider a second alert at 8 USD
+
+**Known risk:** Budgets lives under billing permissions, which are frequently denied on
+member accounts. If `aws budgets create-budget` fails, that is a request for Paweł —
+do not spend a session fighting it. Fallback: a CloudWatch billing alarm, or a manual
+Cost Explorer check at the start of each session.
+
+**Verify:** the budget is listed by `aws budgets describe-budgets --account-id 687222805898`.
+
+---
+
+## Step 2 — Duffel token from the Identity token vault
+
+Finishes [ADR-0002](docs/adr/0002-duffel-credential-through-agentcore-identity.md).
+
+**Open unknown, resolve this first:** how does code inside the Runtime obtain its
+workload access token? `GetWorkloadAccessToken` called from outside fails with
+*"WorkloadIdentity is linked to a service and cannot retrieve an access token by the
+caller"*, so the chain cannot be tested from the CLI. The Runtime already has a workload
+identity: `workload-identity-directory/default/workload-identity/travel_assistant-m6PLoMGxv5`.
+Likely the container receives a token through an environment variable or a local
+endpoint; the Python AgentCore SDK hides this behind `@requires_api_key`. Find the
+mechanism before writing code — check the runtime's own environment by logging
+`process.env` keys once from inside the container.
+
+**Then:**
+- Put the real token into the secret:
+  `aws secretsmanager put-secret-value --secret-id <DuffelSecretArn> --secret-string '{"token":"duffel_test_..."}'`
+- Add a credential-source seam to `src/tools/duffel/client.ts`: environment variable
+  locally, `GetResourceApiKey` in the Runtime. Cache the key in module scope.
+  API shape: `get-resource-api-key --workload-identity-token <t> --resource-credential-provider-name duffel-api-key`
+- The Runtime role already holds `GetWorkloadAccessToken` and `GetResourceApiKey`
+
+**Verify:** invoke the deployed Runtime with a flights question; the answer contains real
+prices and the log group shows a `tool.execute` span for `search_flights`.
+
+**Watch for:** never log the retrieved key. There is already a test asserting that a 401
+body is not echoed — keep that property.
+
+---
+
+## Step 3 — Entry layer: API Gateway + Lambda BFF
+
+**Why:** this completes the request path from [ADR-0001](docs/adr/0001-response-path-through-bff.md)
+and is what makes `curl` testing real, which is how we said we would test in the absence
+of a frontend. The BFF also carries the security control the ADR is built on.
+
+- Lambda BFF: verifies nothing itself (API Gateway does the JWT), reads `sub` from the
+  validated claims, derives `sessionId` from it, invokes the Runtime.
+  **The client must never supply `sessionId`** — that is horizontal privilege escalation
+  into another user's Memory. This is the whole reason the BFF exists.
+- API Gateway REST with a Cognito authorizer, a usage plan and throttling.
+  Throttling is the budget brake — do not skip it.
+- Session ids must be at least 33 characters; derive deterministically from `sub`
+  (e.g. a hash) so a user resumes their own session.
+
+**Verify:** a `curl` with a Cognito token returns an answer; the same `curl` without a
+token returns 401; a client-supplied `sessionId` in the body is ignored.
+
+---
+
+## Step 4 — AgentCore Gateway with tool targets
+
+**The largest step, and the one closest to the project's purpose.** Everything so far
+uses Runtime, Identity, Memory and Observability; the Gateway is the remaining major
+AgentCore capability, and it is what the FigJam diagram actually draws.
+
+**Decision required before coding** (see ADR-0002 for the trade-off already analysed):
+- **Lambda targets** keep our tested transformations (IATA resolution, weekday names,
+  Commons attribution) but the Gateway does not inject outbound credentials for them
+- **OpenAPI targets** let the Gateway inject credentials and need no code, but hand the
+  model raw JSON, which contradicts the tool-design principles in `CLAUDE.md`
+
+A defensible split: Lambda targets for the three transforming tools, plus one trivial
+OpenAPI target purely to demonstrate Gateway-injected credentials.
+
+**Work:**
+- `CfnGateway` with `authorizerType: CUSTOM_JWT` and a `CustomJWTAuthorizer` pointing at
+  the Cognito discovery URL
+  (`https://cognito-idp.us-east-1.amazonaws.com/us-east-1_WuhBjq1L7/.well-known/openid-configuration`),
+  `allowedClients` set to the machine client
+- `CfnGatewayTarget` per tool, with `credentialProviderConfigurations`
+- **Interceptors** enforcing scopes — this replaces `src/guard.ts` in production;
+  keep `guard.ts` as the local mirror so tests still run offline
+- The agent must become an MCP client to reach Gateway tools. This is the real refactor:
+  `src/agent.ts` currently executes tools in process
+- Gateway logs are **not** configured automatically — see `CLAUDE.md`, log delivery for
+  gateway and memory resources must be set up explicitly
+
+**Verify:** a scope-denied call produces the `blocked` trace *from the Gateway*, not from
+our code, and the deployed agent still answers correctly with tools it is allowed.
+
+---
+
+## Step 5 — Memory
+
+**Why:** Memory is deployed and ignored, which is both a waste and a gap in the learning
+goals. It is also what makes the assistant feel like an assistant.
+
+- Short-term: persist turns per session, load history on invocation. `src/agent.ts`
+  already accepts a `history` parameter designed for this.
+- Long-term: extract preferences (favourite destinations, budget style) into strategies
+- Memory has `MemoryStrategies` and `IndexedKeys` in CloudFormation — worth reading
+  before designing the schema
+
+**Verify:** two invocations with the same session id; the second answers a question that
+only makes sense given the first ("and what about the weather there?").
+
+---
+
+## Step 6 — Give the DynamoDB table a job, or delete it
+
+An unused resource contradicts our own Cost Optimization stance. Either it stores
+something real (saved itineraries, a per-user profile that outlives Memory expiry) or it
+goes. **Deleting it is a perfectly good outcome** — do not invent a use for it.
+
+---
+
+## Step 7 — CI/CD
+
+Depends on Step 0 and a remote. The mentoring goals name CI/CD explicitly.
+
+- On pull request: `npm test`, `npm run typecheck`, `cdk synth`
+- Deployment stays manual, or uses OIDC to assume the CDK `deploy` role
+- Note the constraint from `CLAUDE.md`: our identity has an explicit IAM deny and
+  deploys go through the bootstrap roles. Any CI role needs `sts:AssumeRole` on those,
+  granted by Paweł — the same conversation as `docs/blocker-iam.md`
+
+---
+
+## Step 8 — Deeper observability (optional)
+
+- CloudWatch Transaction Search plus ADOT gives the CloudWatch GenAI dashboard, service
+  spans and latency percentiles. Our own JSON spans already satisfy the diagram, so this
+  is for the AWS-native view.
+- **p99 turn latency is the metric that matters:** ADR-0001 accepts a ~29 s API Gateway
+  ceiling, and p99 approaching it is the documented signal to move to streaming (v2).
+  Nothing measures it yet.
+- Alarms on Runtime errors and throttles
+
+---
+
+## Step 9 — Confirm real costs
+
+We never established Bedrock rates for Haiku 4.5 — the Price List API only carries
+legacy models and the pricing page is JS-rendered. After a day of real usage, read Cost
+Explorer and write the actual per-invocation cost into `CLAUDE.md`. Measured numbers beat
+a price list we could not read.
+
+---
+
+## Open decisions
+
+| Decision | Notes |
+|---|---|
+| Lambda vs OpenAPI Gateway targets | Step 4; trade-off already analysed in ADR-0002 |
+| Whether the DynamoDB table survives | Step 6; deletion is fine |
+| Whether a frontend is ever built | Deferred; `curl` remains the interface |
+| Git remote and where CI runs | Step 0/7 |
+
+## Rules that always apply
+
+- **`cdk destroy` after a working session.** Idle cost is near zero but the habit is the point.
+- **Show `cdk diff` before any deploy.** Jakub runs `cdk deploy` himself with `!`.
+- **English in the repo**, Polish in conversation.
+- **Explain decisions and rejected alternatives** — this is a learning project.
+- **Record architectural decisions as ADRs** in `docs/adr/`.
+- **`READY` and `200` do not mean it works.** Verify by observing output.
