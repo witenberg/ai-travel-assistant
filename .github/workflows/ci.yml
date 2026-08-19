@@ -41,9 +41,9 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           # Matches the runtime container (node:24-alpine). The Lambda bundles target
           # node22 through an esbuild flag, which is independent of the Node running here.
