@@ -8,6 +8,7 @@ import { CompositeToolProvider, LocalToolProvider, type ToolProvider } from './t
 import { GatewayToolProvider, type ToolSpecCache } from './tools/gatewayProvider.js';
 import { McpClient } from './mcp/client.js';
 import { SESSION_HEADER as GATEWAY_SESSION_HEADER } from './gateway/interceptor.js';
+import { runWithWorkloadToken, workloadTokenFromHeaders } from './identity/workloadToken.js';
 import { Trace } from './observability/trace.js';
 
 /**
@@ -30,6 +31,27 @@ const SESSION_HEADER = 'x-amzn-bedrock-agentcore-runtime-session-id';
 
 /** Requests larger than this are rejected before we buffer them. */
 const MAX_BODY_BYTES = 256 * 1024;
+
+/**
+ * The header *names* AgentCore sends us, recorded once per container.
+ *
+ * Written for ROADMAP step 2, and it stays. What the Runtime injects into the container
+ * is not something we control or can read from the outside, and the whole reason step 2
+ * had an open unknown is that nobody had looked. Names are safe to log; values are not,
+ * and one of these headers is a live workload access token — so this logs `Object.keys`
+ * and never the object.
+ */
+let headerNamesLogged = false;
+function logInboundHeaderNames(headers: NodeJS.Dict<string | string[]>, tokenHeader?: string): void {
+  if (headerNamesLogged) return;
+  headerNamesLogged = true;
+  console.error(JSON.stringify({
+    type: 'diagnostic',
+    event: 'invocation_headers',
+    names: Object.keys(headers).sort(),
+    workloadTokenHeader: tokenHeader ?? null,
+  }));
+}
 
 type AgentRunner = typeof runAgent;
 
@@ -179,55 +201,62 @@ export function createServer(
     }
 
     health.enter();
+    // AgentCore hands the workload access token to the container on the invocation
+    // itself (see identity/workloadToken.ts). Picked up here, at the only place it
+    // arrives, and made available to the turn rather than passed through five signatures.
+    const workload = workloadTokenFromHeaders(req.headers);
+    logInboundHeaderNames(req.headers, workload?.header);
     try {
-      let payload: InvocationPayload;
-      try {
-        payload = JSON.parse(await readBody(req)) as InvocationPayload;
-      } catch (err) {
-        return sendJson(res, 400, { error: `invalid JSON body: ${(err as Error).message}` });
-      }
+      return await runWithWorkloadToken(workload?.token, async () => {
+        let payload: InvocationPayload;
+        try {
+          payload = JSON.parse(await readBody(req)) as InvocationPayload;
+        } catch (err) {
+          return sendJson(res, 400, { error: `invalid JSON body: ${(err as Error).message}` });
+        }
 
-      const prompt = payload.prompt?.trim();
-      if (!prompt) return sendJson(res, 400, { error: 'field "prompt" is required' });
+        const prompt = payload.prompt?.trim();
+        if (!prompt) return sendJson(res, 400, { error: 'field "prompt" is required' });
 
-      // A session id from AgentCore is authoritative. The fallback exists only for
-      // local runs; in production the BFF maps the user to a session before we see it.
-      const sessionId = (req.headers[SESSION_HEADER] as string | undefined) ?? `local-${randomUUID()}`;
+        // A session id from AgentCore is authoritative. The fallback exists only for
+        // local runs; in production the BFF maps the user to a session before we see it.
+        const sessionId = (req.headers[SESSION_HEADER] as string | undefined) ?? `local-${randomUUID()}`;
 
-      const scopes = payload.scopes ?? [...ALL_SCOPES];
+        const scopes = payload.scopes ?? [...ALL_SCOPES];
 
-      let tools: ToolProvider;
-      try {
-        tools = deps.tools ?? buildToolProvider({
-          scopes,
-          accessToken: payload.accessToken,
+        let tools: ToolProvider;
+        try {
+          tools = deps.tools ?? buildToolProvider({
+            scopes,
+            accessToken: payload.accessToken,
+            sessionId,
+            specCache,
+          });
+        } catch (err) {
+          // Fail closed and say so. A misconfigured Gateway must not degrade into local
+          // execution, because local execution is the path whose authorization we moved away.
+          new Trace(sessionId).blocked('agent.tool_provider', {
+            decision: 'deny',
+            reason: err instanceof Error ? err.message : String(err),
+          });
+          return sendJson(res, 403, { error: 'tools are unavailable for this request', status: 'error' });
+        }
+
+        const result: AgentResult = await agent(prompt, {
           sessionId,
-          specCache,
+          actorId: payload.actorId ?? sessionId,
+          scopes,
+          memory,
+          tools,
         });
-      } catch (err) {
-        // Fail closed and say so. A misconfigured Gateway must not degrade into local
-        // execution, because local execution is the path whose authorization we moved away.
-        new Trace(sessionId).blocked('agent.tool_provider', {
-          decision: 'deny',
-          reason: err instanceof Error ? err.message : String(err),
+
+        return sendJson(res, 200, {
+          response: result.answer,
+          status: 'success',
+          sessionId,
+          traceId: result.traceId,
+          toolCalls: result.toolCalls,
         });
-        return sendJson(res, 403, { error: 'tools are unavailable for this request', status: 'error' });
-      }
-
-      const result: AgentResult = await agent(prompt, {
-        sessionId,
-        actorId: payload.actorId ?? sessionId,
-        scopes,
-        memory,
-        tools,
-      });
-
-      return sendJson(res, 200, {
-        response: result.answer,
-        status: 'success',
-        sessionId,
-        traceId: result.traceId,
-        toolCalls: result.toolCalls,
       });
     } catch (err) {
       // AgentCore surfaces any container 4xx/5xx to the caller as 424 RuntimeClientError,

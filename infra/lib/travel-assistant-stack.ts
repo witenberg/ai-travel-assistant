@@ -92,6 +92,30 @@ export class TravelAssistantStack extends Stack {
       removalPolicy: RemovalPolicy.DESTROY,
     });
 
+    /**
+     * With `apiKeySecretSource: EXTERNAL` the secret stays ours and AgentCore Identity
+     * reads its value at request time — so Identity needs permission on the secret, and a
+     * service principal has no identity policy in our account to grant it. Hence a
+     * resource policy on the secret rather than a role.
+     *
+     * The principal is `identity.bedrock-agentcore.amazonaws.com`. Note the asymmetry with
+     * everything else AgentCore: the runtime, memory and gateway roles are all assumed by
+     * `bedrock-agentcore.amazonaws.com`, but the token vault reads secrets under its own
+     * per-capability principal.
+     *
+     * `aws:SourceAccount` is confused-deputy protection: without it, a credential provider
+     * in *any* AWS account could name this secret's ARN and have Identity read it out on
+     * their behalf. It is also the one condition in this change we have not seen confirmed
+     * in the docs — if `GetResourceApiKey` comes back AccessDenied, dropping this condition
+     * is the first thing to try.
+     */
+    duffelSecret.addToResourcePolicy(new iam.PolicyStatement({
+      principals: [new iam.ServicePrincipal('identity.bedrock-agentcore.amazonaws.com')],
+      actions: ['secretsmanager:GetSecretValue'],
+      resources: ['*'],
+      conditions: { StringEquals: { 'aws:SourceAccount': this.account } },
+    }));
+
     const duffelCredentials = new agentcore.CfnApiKeyCredentialProvider(this, 'DuffelCredentials', {
       name: 'duffel-api-key',
       apiKeySecretSource: 'EXTERNAL',
