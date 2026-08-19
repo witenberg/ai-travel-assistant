@@ -1,5 +1,5 @@
 import {
-  Stack, type StackProps, RemovalPolicy, CfnOutput, SecretValue,
+  Stack, type StackProps, RemovalPolicy, CfnOutput, SecretValue, Duration,
 } from 'aws-cdk-lib';
 import type { Construct } from 'constructs';
 import * as iam from 'aws-cdk-lib/aws-iam';
@@ -9,6 +9,9 @@ import * as secrets from 'aws-cdk-lib/aws-secretsmanager';
 import * as agentcore from 'aws-cdk-lib/aws-bedrockagentcore';
 import * as ecrAssets from 'aws-cdk-lib/aws-ecr-assets';
 import * as logs from 'aws-cdk-lib/aws-logs';
+import * as lambda from 'aws-cdk-lib/aws-lambda';
+import * as lambdaNode from 'aws-cdk-lib/aws-lambda-nodejs';
+import * as apigw from 'aws-cdk-lib/aws-apigateway';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -183,6 +186,118 @@ export class TravelAssistantStack extends Stack {
       removalPolicy: RemovalPolicy.DESTROY,
     });
 
+    // ---------------------------------------------------------------- entry layer
+    // ADR-0001: the request path is Cognito -> API Gateway -> Lambda BFF -> Runtime.
+    // The BFF exists for one reason: it turns a verified `sub` into a session id, and a
+    // session id the client can choose is a way into another user's Memory.
+    const bffLogs = new logs.LogGroup(this, 'BffLogs', {
+      logGroupName: '/aws/lambda/travel-assistant-bff',
+      retention: logs.RetentionDays.ONE_WEEK,
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+
+    const bff = new lambdaNode.NodejsFunction(this, 'Bff', {
+      functionName: 'travel-assistant-bff',
+      entry: path.join(REPO_ROOT, 'src/bff/handler.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_22_X,
+      // ARM64 is ~20% cheaper per GB-second and this code has no native dependencies.
+      architecture: lambda.Architecture.ARM_64,
+      // The function spends nearly all of its life waiting on a socket, and that wait is
+      // billed in GB-seconds — so memory size multiplies the cost of doing nothing.
+      // 256 MB is ample for JSON parsing and a single SDK call.
+      memorySize: 256,
+      // One second under the API Gateway integration ceiling, so the Lambda times out
+      // first and writes a span. If the gateway gave up first we would get a bare 504
+      // and no record of how far the turn got.
+      timeout: Duration.seconds(28),
+      logGroup: bffLogs,
+      environment: {
+        AGENT_RUNTIME_ARN: runtime.attrAgentRuntimeArn,
+        AGENT_ENDPOINT_NAME: 'DEFAULT',
+        NODE_OPTIONS: '--enable-source-maps',
+      },
+      bundling: {
+        format: lambdaNode.OutputFormat.ESM,
+        target: 'node22',
+        sourceMap: true,
+        // Nothing is left external. The Node 22 runtime ships *some* of AWS SDK v3, but
+        // which clients and at which version is not a contract we control — and
+        // `client-bedrock-agentcore` is new enough that relying on it being present is a
+        // bet. Bundling costs a couple of megabytes and removes the class of failure
+        // that only shows up in the cloud.
+        externalModules: [],
+      },
+      projectRoot: REPO_ROOT,
+      depsLockFilePath: path.join(REPO_ROOT, 'package-lock.json'),
+      description: 'Maps an authenticated user to an AgentCore session and invokes the Runtime',
+    });
+
+    // Scoped to this runtime and its endpoints. `InvokeAgentRuntime` on "*" would let the
+    // BFF call any agent in the account, which is exactly the blast radius we can avoid
+    // for free here.
+    bff.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['bedrock-agentcore:InvokeAgentRuntime'],
+      resources: [
+        runtime.attrAgentRuntimeArn,
+        `${runtime.attrAgentRuntimeArn}/runtime-endpoint/*`,
+      ],
+    }));
+
+    const api = new apigw.RestApi(this, 'Api', {
+      restApiName: 'travel-assistant',
+      description: 'Public entry point for the travel assistant',
+      deployOptions: {
+        stageName: 'v1',
+        // Stage-level throttling is the budget brake that does not depend on a key:
+        // it applies to every caller, including one holding a valid token.
+        throttlingRateLimit: 2,
+        throttlingBurstLimit: 5,
+        // Detailed per-method metrics and access logs are deliberately off. Both are
+        // billable, and account-level API Gateway logging needs an `AWS::ApiGateway::Account`
+        // role that would outlive `cdk destroy`.
+      },
+      // No account-level CloudWatch role. CDK creates one by default, but it writes to
+      // `AWS::ApiGateway::Account`, which is a single account-wide setting shared with
+      // every other API in the account — `cdk destroy` would then either leave it behind
+      // or reset something we do not own. We do not use access logging, so we opt out.
+      cloudWatchRole: false,
+      // REST, not HTTP API: the Cognito authorizer, usage plans and API keys we rely on
+      // here are REST features. HTTP API is cheaper but has neither usage plans nor keys.
+      endpointTypes: [apigw.EndpointType.REGIONAL],
+    });
+
+    const authorizer = new apigw.CognitoUserPoolsAuthorizer(this, 'JwtAuthorizer', {
+      cognitoUserPools: [userPool],
+      authorizerName: 'travel-assistant-jwt',
+    });
+
+    const chat = api.root.addResource('chat');
+    chat.addMethod('POST', new apigw.LambdaIntegration(bff, { proxy: true }), {
+      authorizer,
+      authorizationType: apigw.AuthorizationType.COGNITO,
+      // The gateway admits a token carrying any one of these; which tools it may then
+      // use is decided per call, from the same claim, by the BFF and the guard.
+      authorizationScopes: TOOL_SCOPES.map((s) => `${resourceServer.userPoolResourceServerId}/${s}`),
+      // A key is required on top of the JWT purely so the request falls under a usage
+      // plan — that is the only way to attach a daily quota in API Gateway.
+      apiKeyRequired: true,
+    });
+
+    const apiKey = api.addApiKey('DefaultKey', { apiKeyName: 'travel-assistant-key' });
+    const plan = api.addUsagePlan('DefaultPlan', {
+      name: 'travel-assistant-plan',
+      throttle: { rateLimit: 2, burstLimit: 5 },
+      // The number that actually protects the 10 USD cap. One turn is roughly three
+      // model calls, ~6k input and ~1k output tokens, which at Haiku 4.5 list rates is
+      // about 1 US cent. 100 calls a day is therefore a ceiling near 1 USD a day —
+      // a tenth of the account cap per day, which is the most we are willing to lose
+      // to a runaway loop or a leaked key overnight.
+      quota: { limit: 100, period: apigw.Period.DAY },
+    });
+    plan.addApiKey(apiKey);
+    plan.addApiStage({ stage: api.deploymentStage });
+
     // ---------------------------------------------------------------- outputs
     new CfnOutput(this, 'RuntimeArn', { value: runtime.attrAgentRuntimeArn });
     new CfnOutput(this, 'UserPoolId', { value: userPool.userPoolId });
@@ -190,5 +305,7 @@ export class TravelAssistantStack extends Stack {
     new CfnOutput(this, 'TokenEndpoint', { value: `${userPoolDomain.baseUrl()}/oauth2/token` });
     new CfnOutput(this, 'DuffelSecretArn', { value: duffelSecret.secretArn });
     new CfnOutput(this, 'TableName', { value: table.tableName });
+    new CfnOutput(this, 'ApiUrl', { value: `${api.url}chat` });
+    new CfnOutput(this, 'ApiKeyId', { value: apiKey.keyId });
   }
 }

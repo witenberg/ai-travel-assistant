@@ -1,0 +1,187 @@
+import { createHash } from 'node:crypto';
+import {
+  BedrockAgentCoreClient,
+  InvokeAgentRuntimeCommand,
+} from '@aws-sdk/client-bedrock-agentcore';
+import { Trace } from '../observability/trace.js';
+import { ALL_SCOPES } from '../guard.js';
+
+/**
+ * Backend for Frontend.
+ *
+ * ADR-0001: the answer returns synchronously through this Lambda instead of streaming
+ * from the Runtime to the browser. The reason is the mapping below — turning a verified
+ * JWT into a session id is a security control, and a control the client can reach is not
+ * a control. That mapping is the whole justification for this component; everything else
+ * here is plumbing.
+ *
+ * This function verifies nothing itself. API Gateway's Cognito authorizer has already
+ * rejected the request if the token is missing, expired or from another pool, so by the
+ * time we run, `requestContext.authorizer.claims` is trustworthy. Re-validating here
+ * would be a second implementation of the same rule, free to drift from the first.
+ */
+
+/** The Cognito resource server that carries our tool scopes; its id prefixes every scope. */
+const SCOPE_PREFIX = 'tools/';
+
+/** AgentCore rejects session ids shorter than this. A sha256 hex digest is 64. */
+const MIN_SESSION_ID_LENGTH = 33;
+
+const KNOWN_SCOPES: readonly string[] = ALL_SCOPES;
+
+/** Minimal shape of an API Gateway REST proxy event — only the fields we read. */
+export interface ProxyEvent {
+  body?: string | null;
+  isBase64Encoded?: boolean;
+  requestContext?: {
+    requestId?: string;
+    authorizer?: { claims?: Record<string, string | undefined> };
+  };
+}
+
+export interface ProxyResult {
+  statusCode: number;
+  headers: Record<string, string>;
+  body: string;
+}
+
+/**
+ * Session id derived from the token's `sub`, never from the request body.
+ *
+ * Hashed rather than used raw for two reasons: the id is written into AgentCore Memory
+ * and into log lines that leave our account boundary, and a hash keeps the Cognito
+ * identity from spreading into systems that have no reason to hold it. The cost is that
+ * a session id can no longer be read backwards to a user during support — acceptable,
+ * because the same mapping can always be recomputed from a known `sub`.
+ */
+export function deriveSessionId(sub: string): string {
+  const digest = createHash('sha256').update(`travel-assistant:${sub}`).digest('hex');
+  if (digest.length < MIN_SESSION_ID_LENGTH) throw new Error('derived session id is too short');
+  return digest;
+}
+
+/**
+ * Tool scopes granted by the token.
+ *
+ * Cognito emits the `scope` claim as a space-delimited list of fully qualified scopes
+ * (`tools/weather:read`). We strip the resource-server prefix so the agent sees the same
+ * short names `guard.ts` uses, and drop anything we do not recognise — `openid`,
+ * `aws.cognito.signin.user.admin` and friends are not tool permissions.
+ */
+export function extractScopes(scopeClaim: string | undefined): string[] {
+  if (!scopeClaim) return [];
+  return scopeClaim
+    .split(/\s+/)
+    .filter((s) => s.startsWith(SCOPE_PREFIX))
+    .map((s) => s.slice(SCOPE_PREFIX.length))
+    .filter((s) => KNOWN_SCOPES.includes(s));
+}
+
+function respond(statusCode: number, body: unknown): ProxyResult {
+  return {
+    statusCode,
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  };
+}
+
+function decodeBody(event: ProxyEvent): string {
+  if (!event.body) return '';
+  return event.isBase64Encoded ? Buffer.from(event.body, 'base64').toString('utf8') : event.body;
+}
+
+type Invoker = Pick<BedrockAgentCoreClient, 'send'>;
+
+export interface HandlerDeps {
+  client?: Invoker;
+  runtimeArn?: string;
+  qualifier?: string;
+}
+
+export function createHandler(deps: HandlerDeps = {}) {
+  // Created once per container, not per request: the SDK client holds the connection
+  // pool and the credential cache, and rebuilding it on every invocation adds latency
+  // to a path that already has a ~29 s ceiling.
+  const client = deps.client ?? new BedrockAgentCoreClient({
+    region: process.env.AWS_REGION ?? 'us-east-1',
+  });
+
+  return async function handler(event: ProxyEvent): Promise<ProxyResult> {
+    const claims = event.requestContext?.authorizer?.claims ?? {};
+    const sub = claims.sub;
+    const runtimeArn = deps.runtimeArn ?? process.env.AGENT_RUNTIME_ARN;
+    const qualifier = deps.qualifier ?? process.env.AGENT_ENDPOINT_NAME ?? 'DEFAULT';
+
+    if (!runtimeArn) {
+      console.error(JSON.stringify({ type: 'error', route: 'bff', message: 'AGENT_RUNTIME_ARN is not set' }));
+      return respond(500, { error: 'agent runtime is not configured' });
+    }
+
+    // Only reachable if the authorizer is missing or misconfigured — a token without
+    // `sub` cannot be mapped to a session, and guessing one would defeat the isolation.
+    if (!sub) return respond(401, { error: 'token carries no subject' });
+
+    const sessionId = deriveSessionId(sub);
+    const trace = new Trace(sessionId);
+
+    let payload: { prompt?: unknown; sessionId?: unknown; scopes?: unknown };
+    try {
+      payload = JSON.parse(decodeBody(event) || '{}');
+    } catch (err) {
+      return respond(400, { error: `invalid JSON body: ${(err as Error).message}` });
+    }
+
+    const prompt = typeof payload.prompt === 'string' ? payload.prompt.trim() : '';
+    if (!prompt) return respond(400, { error: 'field "prompt" is required' });
+
+    // A client that sends its own sessionId or scopes is attempting to read another
+    // user's Memory or to widen its own permissions. We never read those fields, but we
+    // record the attempt: silently ignoring it would leave no evidence it ever happened.
+    if (payload.sessionId !== undefined || payload.scopes !== undefined) {
+      trace.blocked('bff.client_supplied_identity', {
+        suppliedSessionId: payload.sessionId !== undefined,
+        suppliedScopes: payload.scopes !== undefined,
+        decision: 'ignored',
+      });
+    }
+
+    const scopes = extractScopes(claims.scope);
+    if (scopes.length === 0) {
+      // Fail closed, and fail before Bedrock. Every tool would be blocked downstream
+      // anyway, so invoking the model here would spend budget to produce an apology.
+      trace.blocked('bff.authorize', { grantedScopes: [], decision: 'deny' });
+      return respond(403, { error: 'token grants no tool scopes' });
+    }
+
+    try {
+      const result = await trace.span('bff.invoke_runtime', { runtimeArn, qualifier, scopes }, () =>
+        client.send(new InvokeAgentRuntimeCommand({
+          agentRuntimeArn: runtimeArn,
+          qualifier,
+          runtimeSessionId: sessionId,
+          contentType: 'application/json',
+          accept: 'application/json',
+          payload: new TextEncoder().encode(JSON.stringify({ prompt, scopes })),
+        })),
+      );
+
+      const raw = await result.response?.transformToString();
+      const answer = raw ? JSON.parse(raw) : {};
+
+      return respond(200, {
+        response: answer.response ?? '',
+        sessionId,
+        traceId: answer.traceId ?? trace.traceId,
+        toolCalls: answer.toolCalls ?? [],
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(JSON.stringify({ type: 'error', route: 'bff', sessionId, message }));
+      // 502, not 500: the failure is upstream in the Runtime, and the distinction is
+      // what tells us at 3 a.m. whether to look at this function or at AgentCore.
+      return respond(502, { error: 'the agent runtime did not answer', detail: message });
+    }
+  };
+}
+
+export const handler = createHandler();

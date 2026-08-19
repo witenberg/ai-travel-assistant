@@ -6,3 +6,7 @@ docs
 .env
 *.md
 infra
+# The BFF is a Lambda, not part of the agent image. Excluding it also stops a
+# BFF-only edit from rebuilding the container and bumping the Runtime version.
+src/bff
+scripts

@@ -208,8 +208,9 @@ guardrail that stays. We deploy through the CDK bootstrap roles (variant B in
 Invoke it with `aws bedrock-agentcore invoke-agent-runtime`; the session id must be at
 least 33 characters. Payload is `{"prompt": "...", "scopes": [...]}` base64-encoded.
 
-**Not deployed yet:** API Gateway, Lambda BFF, AgentCore Gateway with tool targets.
-They go into this same stack.
+**Not deployed yet:** API Gateway and the Lambda BFF are **written and synthesised** but
+not yet deployed (Step 3 in `ROADMAP.md`); AgentCore Gateway with tool targets is not
+built. All of it goes into this same stack.
 
 **Still a placeholder:** the Duffel secret holds `REPLACE_ME`, and the tool does not yet
 read from the Identity token vault, so `search_flights` fails in the cloud. The other
@@ -232,6 +233,13 @@ budget allows. Application logic stays deliberately small so the infrastructure 
 the interesting part. Full statement in `README.md`.
 
 ## Decisions made
+
+- **Entry layer (Step 3)** — API Gateway REST rather than HTTP API, because the Cognito
+  authorizer, usage plans and API keys we depend on are REST features and HTTP API has
+  neither usage plans nor keys. The daily quota of 100 requests is the budget brake:
+  one turn costs roughly 1 US cent, so the worst case is capped near 1 USD a day.
+  The BFF derives `sessionId` from a sha256 of the token's `sub` and never reads a
+  client-supplied one — that mapping is the entire reason the component exists.
 
 - **ADR-0002** — the Duffel token is stored in Secrets Manager, registered as an
   AgentCore Identity API key credential provider, and fetched by the tool at runtime via

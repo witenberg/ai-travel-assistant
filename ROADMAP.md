@@ -17,7 +17,7 @@ aws cloudformation describe-stacks --stack-name TravelAssistantStack \
   --query 'Stacks[0].StackStatus' --output text     # or "does not exist" if destroyed
 
 cd /Users/jakub.wi/Desktop/ai_app
-npm test && npm run typecheck                # 35 tests must pass
+npm test && npm run typecheck                # 52 tests must pass
 ```
 
 If the stack is gone, redeploy takes ~3 minutes:
@@ -47,13 +47,25 @@ Docker Desktop must be running before any deploy that rebuilds the image.
 - AgentCore Memory — `MEMORY_ID` is passed to the container and ignored
 - DynamoDB table — no code touches it
 
+**Built, awaiting deploy:**
+- API Gateway (Cognito authorizer, usage plan, throttling) and the Lambda BFF — Step 3
+
 **Not built:**
-- API Gateway, Lambda BFF, AgentCore Gateway with tool targets
-- Version control, CI/CD
+- AgentCore Gateway with tool targets
+- CI/CD
 
 ---
 
-## Step 0 — Version control
+## Step 0 — Version control — **DONE (2026-08-19)**
+
+`git init` on `main`, one initial commit of 40 files. `.gitignore` already covered
+`node_modules/`, `dist/`, `cdk.out/` and `.env`; verified that `git ls-files | grep -c '\.env$'`
+returns 0, so the live Duffel token was never committed.
+
+**Still open:** no remote. Step 7 (CI/CD) needs one — GitHub is the assumption unless
+Jakub prefers otherwise.
+
+<details><summary>original notes</summary>
 
 **Why first:** the project has no git repository at all. The mentoring goal explicitly
 includes the whole SDLC, and every later step (CI/CD, review, ADR history) assumes one.
@@ -66,6 +78,8 @@ It is also the cheapest possible step.
 
 **Verify:** `git status` clean, `git log` has one commit, `git ls-files | grep -c '\.env$'`
 returns 0.
+
+</details>
 
 ---
 
@@ -116,7 +130,56 @@ body is not echoed — keep that property.
 
 ---
 
-## Step 3 — Entry layer: API Gateway + Lambda BFF
+## Step 3 — Entry layer: API Gateway + Lambda BFF — **BUILT, NOT YET DEPLOYED (2026-08-19)**
+
+Code and infrastructure are written, 17 new tests pass, `cdk diff` is clean. What is
+left is the deploy itself, which Jakub runs.
+
+**What was built**
+
+- `src/bff/handler.ts` — reads `sub` from the claims API Gateway already validated,
+  derives `sessionId = sha256("travel-assistant:" + sub)` (64 hex chars, comfortably over
+  the 33-character minimum), extracts tool scopes from the `scope` claim, and invokes the
+  Runtime. A client-supplied `sessionId` or `scopes` is never read — and the attempt is
+  recorded as a `blocked` span rather than silently dropped, so there is evidence it happened.
+- Fails closed *before* Bedrock: a token with no tool scope gets 403 without an
+  invocation, because a turn that can call no tool still costs money.
+- 502 rather than 500 when the Runtime fails, so the status code says which component to look at.
+- CDK: `NodejsFunction` (Node 22, ARM64, 256 MB, 28 s), REST API with a Cognito
+  authorizer, an API key, a usage plan (2 rps, burst 5, **100 requests/day**) and
+  stage-level throttling at the same rate.
+- `scripts/smoke.sh` — fetches a client-credentials token and the API key from the stack
+  outputs, then runs the three checks below.
+
+**Decisions worth knowing**
+
+- *Lambda timeout 28 s, one second under the API Gateway ceiling*, so the Lambda fails
+  first and writes a span; if the gateway gave up first we would get a bare 504 with no
+  record of how far the turn got.
+- *Nothing marked external in the bundle.* The Node 22 runtime ships some of AWS SDK v3,
+  but which clients and at which version is not a contract we control, and
+  `client-bedrock-agentcore` is new. Two megabytes buys away a cloud-only failure mode.
+- *`cloudWatchRole: false` on the API.* CDK creates an account-level
+  `AWS::ApiGateway::Account` role by default; that is shared account-wide state which
+  `cdk destroy` would either strand or reset for someone else. We do not use access logging.
+- *256 MB, not more.* The function spends its life waiting on a socket, and that wait is
+  billed in GB-seconds — memory size multiplies the cost of doing nothing.
+- *The daily quota of 100 is the budget brake.* One turn is roughly three model calls,
+  ~6k input and ~1k output tokens ≈ 1 US cent at Haiku 4.5 list rates. 100/day caps the
+  worst case near 1 USD a day — a tenth of the account cap, which is the most we are
+  willing to lose overnight to a runaway loop or a leaked key.
+
+**Known limitation:** the only Cognito client is the machine (client-credentials) one, so
+`sub` is the app client id and every caller shares one session. Custom scopes are only
+issued through the OAuth token endpoint — `USER_PASSWORD_AUTH` access tokens carry
+`aws.cognito.signin.user.admin` and nothing else — so a real per-human session needs a
+hosted-UI client with the authorization-code flow. Deferred; `curl` testing does not need it.
+
+**Verify after deploy:** `./scripts/smoke.sh` — an authorised call answers, the same call
+without a token returns 401, and a client-supplied `sessionId` comes back replaced by the
+derived one. Then confirm the BFF's spans in `/aws/lambda/travel-assistant-bff`.
+
+<details><summary>original notes</summary>
 
 **Why:** this completes the request path from [ADR-0001](docs/adr/0001-response-path-through-bff.md)
 and is what makes `curl` testing real, which is how we said we would test in the absence
@@ -133,6 +196,8 @@ of a frontend. The BFF also carries the security control the ADR is built on.
 
 **Verify:** a `curl` with a Cognito token returns an answer; the same `curl` without a
 token returns 401; a client-supplied `sessionId` in the body is ignored.
+
+</details>
 
 ---
 
