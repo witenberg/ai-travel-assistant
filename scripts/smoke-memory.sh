@@ -54,7 +54,7 @@ SESSION_ID=$(echo "$FIRST" | python3 -c 'import sys,json; print(json.load(sys.st
 
 echo "==> 2/3  follow-up with no place name in it"
 ask "What is the weather like there this weekend?" \
-  | python3 -c 'import sys,json; d=json.load(sys.stdin); print("   ", d.get("response","")[:600]); print("    toolCalls:", d.get("toolCalls"))'
+  | python3 -c 'import sys,json; d=json.load(sys.stdin); print("   ", d.get("response","")[:600]); print("    toolCalls:", d.get("toolCalls"), "| build:", d.get("build"))'
 
 echo "==> 3/3  the events actually written, read back from the Memory data plane"
 # actorId is derived server-side and never returned to the caller, so we recompute it the

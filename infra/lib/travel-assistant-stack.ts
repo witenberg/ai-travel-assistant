@@ -300,6 +300,45 @@ export class TravelAssistantStack extends Stack {
       description: 'REQUEST interceptor enforcing per-tool OAuth scopes on the Gateway',
     });
 
+    const responseInterceptorLogs = new logs.LogGroup(this, 'ResponseInterceptorLogs', {
+      logGroupName: '/aws/lambda/travel-assistant-gateway-response-interceptor',
+      retention: logs.RetentionDays.ONE_WEEK,
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+
+    /*
+     * The outbound half of the FigJam diagram, which draws `interceptors inbound` *and*
+     * `interceptors outbound`.
+     *
+     * A **second function rather than one registered at both points**, which the API would
+     * allow. The two do different kinds of work and deserve different blast radii: the
+     * REQUEST interceptor is a security control whose failure must deny a tool call, and this
+     * one is telemetry whose failure must cost nothing but a span. Sharing a function would
+     * mean a bug in observability can refuse tool calls, and that trade is not worth the one
+     * Lambda it saves.
+     *
+     * What it is for: AgentCore forwards no session id to a target, and our own
+     * `x-travel-session-id` header reaches interceptors but not targets — so this is the only
+     * place where a tool's *result* and the conversation that asked for it meet.
+     */
+    const responseInterceptor = new lambdaNode.NodejsFunction(this, 'GatewayResponseInterceptor', {
+      functionName: 'travel-assistant-gateway-response-interceptor',
+      entry: path.join(REPO_ROOT, 'src/gateway/responseInterceptor.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_22_X,
+      architecture: lambda.Architecture.ARM_64,
+      memorySize: 128,
+      // Half the REQUEST interceptor's, because it does strictly less: no JWT to decode, no
+      // decision to make. It is still on the critical path of every tool result, and a
+      // timeout here would delay an answer the tool has already produced.
+      timeout: Duration.seconds(3),
+      logGroup: responseInterceptorLogs,
+      bundling: { format: lambdaNode.OutputFormat.CJS, target: 'node22', sourceMap: true, externalModules: [] },
+      projectRoot: REPO_ROOT,
+      depsLockFilePath: path.join(REPO_ROOT, 'package-lock.json'),
+      description: 'RESPONSE interceptor recording tool outcomes against the caller session',
+    });
+
     const toolTargetLogs = new logs.LogGroup(this, 'ToolTargetLogs', {
       logGroupName: '/aws/lambda/travel-assistant-gateway-tools',
       retention: logs.RetentionDays.ONE_WEEK,
@@ -336,7 +375,7 @@ export class TravelAssistantStack extends Stack {
     // able to invoke every function in the account.
     gatewayRole.addToPolicy(new iam.PolicyStatement({
       actions: ['lambda:InvokeFunction'],
-      resources: [toolTarget.functionArn, interceptor.functionArn],
+      resources: [toolTarget.functionArn, interceptor.functionArn, responseInterceptor.functionArn],
     }));
 
     // The same lesson the Runtime taught us, one component along: AgentCore creates its own
@@ -374,20 +413,38 @@ export class TravelAssistantStack extends Stack {
           // scope for every tool — and what we need is per-tool, which is the interceptor's job.
         },
       },
-      interceptorConfigurations: [{
-        interceptor: { lambda: { arn: interceptor.functionArn } },
-        // REQUEST only. A RESPONSE interceptor could filter the tool catalogue by scope, and
-        // that is deliberately not done: hiding a tool removes the very denial the
-        // observability requirement asks us to be able to reconstruct.
-        interceptionPoints: ['REQUEST'],
-        inputConfiguration: {
-          // Required for the design to work at all — the scopes live in the Authorization
-          // header, and without this the interceptor is handed a request with no token and
-          // has to fail closed on every call. It also means this Lambda holds a live access
-          // token in memory, which is why a test asserts it never writes one to a log.
-          passRequestHeaders: true,
+      /*
+       * One interceptor per point, which is also the maximum the service allows: "A gateway
+       * can have at most one REQUEST interceptor and at most one RESPONSE interceptor."
+       *
+       * Neither filters the tool catalogue. Hiding a tool the caller may not use would remove
+       * the very denial the observability requirement is built on, and would trade a readable
+       * refusal for a model that never learns the capability exists (ADR-0004).
+       */
+      interceptorConfigurations: [
+        {
+          interceptor: { lambda: { arn: interceptor.functionArn } },
+          interceptionPoints: ['REQUEST'],
+          inputConfiguration: {
+            // Required for the design to work at all — the scopes live in the Authorization
+            // header, and without this the interceptor is handed a request with no token and
+            // has to fail closed on every call. It also means this Lambda holds a live access
+            // token in memory, which is why a test asserts it never writes one to a log.
+            passRequestHeaders: true,
+          },
         },
-      }],
+        {
+          interceptor: { lambda: { arn: responseInterceptor.functionArn } },
+          interceptionPoints: ['RESPONSE'],
+          inputConfiguration: {
+            // Same flag, different reason: not to read the token, but to read our own
+            // `x-travel-session-id`. Without it the outbound span has no conversation to
+            // belong to, which is the entire point of this interceptor. The token comes along
+            // whether we want it or not, so the same no-logging test applies here.
+            passRequestHeaders: true,
+          },
+        },
+      ],
     });
 
     // Declared rather than left to AgentCore, for the same two reasons as the Runtime's:
@@ -445,8 +502,34 @@ export class TravelAssistantStack extends Stack {
       // expensive thing we could accidentally leave running.
       networkConfiguration: { networkMode: 'PUBLIC' },
       protocolConfiguration: 'HTTP',
+      /*
+       * Two minutes idle, not the default fifteen — and this is a lesson, not a preference.
+       *
+       * A session keeps its warm container until it goes idle, so with the 900 s default the
+       * verification habit this project is built on quietly stops working: `cdk deploy` then
+       * a smoke script answers from the *previous* container, and every re-run resets the
+       * idle timer. Three deploys in a row were judged against code that was not running.
+       *
+       * Shortening it costs a cold start on the next turn after a pause and nothing else —
+       * the conversation lives in AgentCore Memory, keyed on actor and session, not in the
+       * container. It also stops paying for an idle container for a quarter of an hour after
+       * every single question, which is the Cost Optimization argument the rest of the stack
+       * is designed from. `maxLifetime` comes down from 8 hours for the same reason.
+       */
+      lifecycleConfiguration: { idleRuntimeSessionTimeout: 120, maxLifetime: 3600 },
       environmentVariables: {
         MODEL_ID,
+        /*
+         * Which build is answering: the container image's asset tag, which changes on every
+         * code change and on nothing else. It is how a smoke test tells "the deploy worked"
+         * from "a container from before the deploy answered me".
+         *
+         * The whole token, never a slice of it. `image.imageUri.slice(-12)` looked right and
+         * shipped `n[TOKEN.78]}` — string operations at synth time run on the *placeholder*,
+         * not on the value CloudFormation will resolve. The server shortens it at runtime,
+         * where it is a real string.
+         */
+        AGENT_BUILD: image.imageTag,
         MEMORY_ID: memory.attrMemoryId,
         DUFFEL_CREDENTIAL_PROVIDER: duffelCredentials.name,
         // Presence of this variable is what switches the agent from in-process tools to the

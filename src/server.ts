@@ -250,12 +250,21 @@ export function createServer(
           tools,
         });
 
-        return sendJson(res, 200, {
+          return sendJson(res, 200, {
           response: result.answer,
           status: 'success',
           sessionId,
           traceId: result.traceId,
           toolCalls: result.toolCalls,
+          /*
+           * Which build answered. A session keeps its warm container across a deploy, so a
+           * `200` right after one can come from the previous version — three deploys in a row
+           * were verified against code that was not running before this field existed. CDK
+           * sets it from the container image's asset hash, so it changes when the code does.
+           */
+          // Shortened here, not in CDK: at synth time the value is an unresolved token and
+          // slicing it yields a fragment of the placeholder. At runtime it is a real string.
+          build: (process.env.AGENT_BUILD ?? 'local').slice(0, 12),
         });
       });
     } catch (err) {

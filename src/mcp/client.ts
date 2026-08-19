@@ -99,7 +99,27 @@ export class McpClient {
    * expects one.
    */
   private connect(): Promise<void> {
-    this.handshake ??= (async () => {
+    if (this.handshake) return this.handshake;
+
+    /*
+     * A *failed* handshake must not be remembered, and this cost real debugging time.
+     *
+     * Memoising the promise is right for the success case — two concurrent handshakes would
+     * be two sessions where the server expects one. Memoising a rejection is a trap: every
+     * later turn in that container replays the original error instead of retrying, so a
+     * single transient failure at container start becomes permanent for the life of the
+     * session. It is also invisible in the logs unless you look closely, because the replay
+     * costs no I/O: the span said `durationMs: 0`, which is what gave it away.
+     */
+    this.handshake = this.performHandshake().catch((err) => {
+      this.handshake = undefined;
+      throw err;
+    });
+    return this.handshake;
+  }
+
+  private performHandshake(): Promise<void> {
+    return (async () => {
       const result = await this.rpc('initialize', {
         protocolVersion: PREFERRED_PROTOCOL_VERSION,
         capabilities: {},
@@ -112,7 +132,6 @@ export class McpClient {
       // Fire-and-forget by design: `notifications/initialized` has no id and no reply.
       await this.notify('notifications/initialized');
     })();
-    return this.handshake;
   }
 
   async listTools(): Promise<McpTool[]> {

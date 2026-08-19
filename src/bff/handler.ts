@@ -213,6 +213,9 @@ export function createHandler(deps: HandlerDeps = {}) {
         sessionId,
         traceId: answer.traceId ?? trace.traceId,
         toolCalls: answer.toolCalls ?? [],
+        // Forwarded, not derived: which container build answered is the caller's only way to
+        // know whether a `200` came from the version that was just deployed. See src/server.ts.
+        build: answer.build,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

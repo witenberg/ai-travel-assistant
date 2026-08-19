@@ -64,7 +64,7 @@ RESPONSE=$(curl -sS -X POST "$API_URL" \
   -H "x-api-key: $API_KEY" \
   -H 'content-type: application/json' \
   -d "{\"prompt\": \"Find flights from London to Lisbon on $DEPARTURE.\"}")
-echo "$RESPONSE" | python3 -c 'import sys,json; d=json.load(sys.stdin); print("   ", d.get("response","")[:800]); print("    toolCalls:", d.get("toolCalls"))'
+echo "$RESPONSE" | python3 -c 'import sys,json; d=json.load(sys.stdin); print("   ", d.get("response","")[:800]); print("    toolCalls:", d.get("toolCalls"), "| build:", d.get("build"))'
 
 echo "==> 2/3  which header carried the workload access token (once per container)"
 # Empty output here is normal on a warm container: the line is written once per process, so

@@ -75,6 +75,17 @@ export class Trace {
     this.record(name, 'ok', Date.now(), attributes);
   }
 
+  /**
+   * The third outcome, for a step we *observed* rather than performed.
+   *
+   * `span()` already records an error when the work it wrapped threw, which covers
+   * everything the Runtime does. This exists for the gateway's RESPONSE interceptor, which
+   * sees a failure that happened somewhere else entirely and has nothing to wrap.
+   */
+  error(name: string, attributes: Record<string, unknown>): void {
+    this.record(name, 'error', Date.now(), attributes);
+  }
+
   private record(name: string, status: SpanStatus, startedAt: number, attributes: Record<string, unknown>): void {
     this.emit({
       type: 'span',

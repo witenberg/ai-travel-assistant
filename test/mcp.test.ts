@@ -97,6 +97,29 @@ describe('mcp client — handshake', () => {
     assert.equal(server.requests.filter((r) => r.body.method === 'initialize').length, 1);
   });
 
+  // A rejected handshake used to be memoised, so one bad container start failed every later
+  // turn in that session — replayed with no I/O at all, which is why the span said 0 ms.
+  test('retries a failed handshake instead of replaying the failure forever', async () => {
+    let initializes = 0;
+    const { server, client } = clientFor({
+      initialize: (body: any) => {
+        initializes++;
+        return initializes === 1
+          ? { status: 400, body: '{}' }
+          : { body: rpcOk(body.id, { protocolVersion: '2025-03-26' }), headers: { 'mcp-session-id': 'sess-42' } };
+      },
+      'notifications/initialized': () => ({ status: 202, body: '' }),
+      'tools/list': (body: any) => ({ body: rpcOk(body.id, { tools: [{ name: 't' }] }) }),
+    });
+
+    await assert.rejects(() => client.listTools(), /HTTP 400/);
+    const tools = await client.listTools();
+
+    assert.equal(initializes, 2, 'the second turn must try the handshake again');
+    assert.equal(tools.length, 1);
+    assert.ok(server.requests.some((r) => r.body.method === 'tools/list'));
+  });
+
   // A client that keeps announcing a version the server did not agree to is a client that
   // breaks on the next service-side upgrade.
   test('adopts the protocol version the server answered with', async () => {
