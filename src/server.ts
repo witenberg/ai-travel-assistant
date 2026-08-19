@@ -2,6 +2,7 @@ import { createServer as createHttpServer, type IncomingMessage, type ServerResp
 import { randomUUID } from 'node:crypto';
 import { runAgent, type AgentResult } from './agent.js';
 import { ALL_SCOPES } from './guard.js';
+import { memoryStoreFromEnv, type MemoryStore } from './memory/store.js';
 
 /**
  * AgentCore Runtime HTTP service contract.
@@ -29,6 +30,15 @@ type AgentRunner = typeof runAgent;
 interface InvocationPayload {
   prompt?: string;
   scopes?: string[];
+  /**
+   * The person behind the session, derived by the BFF from the verified JWT.
+   *
+   * Server-supplied, exactly like `scopes`: only the BFF holds `InvokeAgentRuntime` and
+   * the Runtime is not publicly reachable, so this channel carries the same trust the
+   * scope list already does. A client cannot reach it, which is the property that makes
+   * reading another actor's long-term memory impossible.
+   */
+  actorId?: string;
 }
 
 /**
@@ -88,8 +98,11 @@ function readBody(req: IncomingMessage): Promise<string> {
   });
 }
 
-export function createServer(deps: { runAgent?: AgentRunner } = {}) {
+export function createServer(deps: { runAgent?: AgentRunner; memory?: MemoryStore } = {}) {
   const agent = deps.runAgent ?? runAgent;
+  // Built once per container, not per request: the store owns an SDK client, and the
+  // connection pool and credential cache are the whole reason to keep it alive.
+  const memory = deps.memory ?? memoryStoreFromEnv();
   const health = new HealthState();
 
   return createHttpServer(async (req, res) => {
@@ -121,7 +134,9 @@ export function createServer(deps: { runAgent?: AgentRunner } = {}) {
 
       const result: AgentResult = await agent(prompt, {
         sessionId,
+        actorId: payload.actorId ?? sessionId,
         scopes: payload.scopes ?? [...ALL_SCOPES],
+        memory,
       });
 
       return sendJson(res, 200, {

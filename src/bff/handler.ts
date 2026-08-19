@@ -61,6 +61,20 @@ export function deriveSessionId(sub: string): string {
 }
 
 /**
+ * Actor id derived from the same `sub`, with a different domain separator.
+ *
+ * A separate value rather than a reuse of the session id, even though both come from one
+ * `sub` today. The two answer different questions — "which conversation" and "which
+ * person" — and long-term memory is keyed on the second, so the day a real
+ * per-conversation session id arrives, what the agent learned must not move with it.
+ * Distinct strings also mean a log line naming one can never be mistaken for the other.
+ */
+export function deriveActorId(sub: string): string {
+  // Leading letter: AgentCore requires an actor id to start alphanumeric.
+  return `u-${createHash('sha256').update(`travel-assistant-actor:${sub}`).digest('hex')}`;
+}
+
+/**
  * Tool scopes granted by the token.
  *
  * Cognito emits the `scope` claim as a space-delimited list of fully qualified scopes
@@ -122,9 +136,10 @@ export function createHandler(deps: HandlerDeps = {}) {
     if (!sub) return respond(401, { error: 'token carries no subject' });
 
     const sessionId = deriveSessionId(sub);
+    const actorId = deriveActorId(sub);
     const trace = new Trace(sessionId);
 
-    let payload: { prompt?: unknown; sessionId?: unknown; scopes?: unknown };
+    let payload: { prompt?: unknown; sessionId?: unknown; scopes?: unknown; actorId?: unknown };
     try {
       payload = JSON.parse(decodeBody(event) || '{}');
     } catch (err) {
@@ -134,12 +149,15 @@ export function createHandler(deps: HandlerDeps = {}) {
     const prompt = typeof payload.prompt === 'string' ? payload.prompt.trim() : '';
     if (!prompt) return respond(400, { error: 'field "prompt" is required' });
 
-    // A client that sends its own sessionId or scopes is attempting to read another
-    // user's Memory or to widen its own permissions. We never read those fields, but we
-    // record the attempt: silently ignoring it would leave no evidence it ever happened.
-    if (payload.sessionId !== undefined || payload.scopes !== undefined) {
+    // A client that sends its own sessionId, actorId or scopes is attempting to read
+    // another user's Memory or to widen its own permissions. `actorId` is the newest and
+    // the most valuable of the three: a session holds one conversation, an actor holds
+    // everything the agent has ever learned about a person. We never read those fields,
+    // but we record the attempt — silently ignoring it would leave no evidence it happened.
+    if (payload.sessionId !== undefined || payload.actorId !== undefined || payload.scopes !== undefined) {
       trace.blocked('bff.client_supplied_identity', {
         suppliedSessionId: payload.sessionId !== undefined,
+        suppliedActorId: payload.actorId !== undefined,
         suppliedScopes: payload.scopes !== undefined,
         decision: 'ignored',
       });
@@ -161,7 +179,7 @@ export function createHandler(deps: HandlerDeps = {}) {
           runtimeSessionId: sessionId,
           contentType: 'application/json',
           accept: 'application/json',
-          payload: new TextEncoder().encode(JSON.stringify({ prompt, scopes })),
+          payload: new TextEncoder().encode(JSON.stringify({ prompt, scopes, actorId })),
         })),
       );
 

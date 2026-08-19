@@ -96,12 +96,51 @@ export class TravelAssistantStack extends Stack {
     });
 
     // ---------------------------------------------------------------- agent memory
+    // AgentCore runs the extraction strategy below on its own schedule, under this role
+    // rather than the runtime's. Wider than the runtime's model policy on purpose: the
+    // extraction model is chosen by the service, not by us, so pinning it to the one
+    // inference profile we use would break the day AWS changes that choice — and it
+    // would break silently, as a strategy that quietly stops producing records.
+    const memoryRole = new iam.Role(this, 'MemoryRole', {
+      assumedBy: new iam.ServicePrincipal('bedrock-agentcore.amazonaws.com', {
+        conditions: {
+          StringEquals: { 'aws:SourceAccount': this.account },
+          ArnLike: { 'aws:SourceArn': `arn:aws:bedrock-agentcore:${this.region}:${this.account}:*` },
+        },
+      }),
+      description: 'Extraction role for AgentCore Memory long-term strategies',
+    });
+    memoryRole.addToPolicy(new iam.PolicyStatement({
+      actions: ['bedrock:InvokeModel'],
+      resources: [
+        'arn:aws:bedrock:*::foundation-model/*',
+        `arn:aws:bedrock:${this.region}:${this.account}:inference-profile/*`,
+      ],
+    }));
+
     const memory = new agentcore.CfnMemory(this, 'Memory', {
       name: 'travel_assistant_memory',
-      description: 'Short-term conversation state for the travel assistant',
+      description: 'Conversation state and travel preferences for the travel assistant',
       // Shortest useful retention. Memory is billed on stored events, so a long
-      // expiry on a playground account is money spent on nothing.
+      // expiry on a playground account is money spent on nothing. This bounds the raw
+      // events only — extracted preference records have their own lifetime, which is
+      // the point of the split: the conversation is cheap to forget, the lesson is not.
       eventExpiryDuration: 7,
+      memoryExecutionRoleArn: memoryRole.roleArn,
+      // Long-term memory. USER_PREFERENCE rather than SEMANTIC or SUMMARY because the
+      // useful thing to carry between conversations is what this traveller likes, not a
+      // precis of what was said — a summary strategy would re-store the same forecasts
+      // we can fetch for free, and pay a model to write them.
+      memoryStrategies: [{
+        userPreferenceMemoryStrategy: {
+          name: 'travel_preferences',
+          description: 'Destinations, climate and trip style this traveller prefers',
+          // Keyed on the actor, not the session: preferences must outlive a conversation.
+          // {actorId} is substituted by AgentCore; PREFERENCE_NAMESPACE in
+          // src/memory/store.ts builds the same string for retrieval and must match.
+          namespaces: ['/preferences/{actorId}'],
+        },
+      }],
     });
 
     // ---------------------------------------------------------------- container image
@@ -136,6 +175,21 @@ export class TravelAssistantStack extends Stack {
     runtimeRole.addToPolicy(new iam.PolicyStatement({
       actions: ['bedrock-agentcore:GetWorkloadAccessToken', 'bedrock-agentcore:GetResourceApiKey'],
       resources: ['*'],
+    }));
+
+    // Memory data plane. Scoped to this one memory resource: the runtime has no business
+    // reading events from any other, and `*` here would make cross-actor recall a policy
+    // change away rather than an impossibility.
+    runtimeRole.addToPolicy(new iam.PolicyStatement({
+      actions: [
+        'bedrock-agentcore:CreateEvent',
+        'bedrock-agentcore:ListEvents',
+        'bedrock-agentcore:RetrieveMemoryRecords',
+      ],
+      resources: [
+        `arn:aws:bedrock-agentcore:${this.region}:${this.account}:memory/${memory.attrMemoryId}`,
+        `arn:aws:bedrock-agentcore:${this.region}:${this.account}:memory/${memory.attrMemoryId}/*`,
+      ],
     }));
 
     table.grantReadWriteData(runtimeRole);
@@ -312,6 +366,7 @@ export class TravelAssistantStack extends Stack {
     new CfnOutput(this, 'TokenEndpoint', { value: `${userPoolDomain.baseUrl()}/oauth2/token` });
     new CfnOutput(this, 'DuffelSecretArn', { value: duffelSecret.secretArn });
     new CfnOutput(this, 'TableName', { value: table.tableName });
+    new CfnOutput(this, 'MemoryId', { value: memory.attrMemoryId });
     new CfnOutput(this, 'ApiUrl', { value: `${api.url}chat` });
     new CfnOutput(this, 'ApiKeyId', { value: apiKey.keyId });
   }

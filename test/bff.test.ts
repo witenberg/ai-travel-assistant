@@ -1,6 +1,6 @@
 import { test, describe, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { createHandler, deriveSessionId, extractScopes } from '../src/bff/handler.js';
+import { createHandler, deriveActorId, deriveSessionId, extractScopes } from '../src/bff/handler.js';
 
 /** Captures what the BFF asked the Runtime to do, so we can assert on the mapping. */
 let lastInput: any = null;
@@ -30,6 +30,53 @@ const invoke = (body: unknown, claims: Record<string, string> = {}) =>
   });
 
 beforeEach(() => { lastInput = null; nextError = null; });
+
+describe('actor mapping', () => {
+  test('is deterministic per subject and distinct across subjects', () => {
+    assert.equal(deriveActorId(SUB), deriveActorId(SUB));
+    assert.notEqual(deriveActorId(SUB), deriveActorId('another-subject'));
+  });
+
+  // Same `sub`, two different questions: which conversation, and which person. Long-term
+  // memory is keyed on the second, so the day a per-conversation session id arrives, what
+  // the agent has learned must not move with it.
+  test('is a different value from the session id of the same subject', () => {
+    assert.notEqual(deriveActorId(SUB), deriveSessionId(SUB));
+  });
+
+  test('never leaks the raw subject', () => {
+    assert.ok(!deriveActorId(SUB).includes(SUB));
+  });
+
+  test('starts alphanumeric, as AgentCore requires of an actor id', () => {
+    assert.match(deriveActorId(SUB), /^[a-zA-Z0-9][a-zA-Z0-9\-_/]*$/);
+    assert.ok(deriveActorId(SUB).length <= 255);
+  });
+
+  test('the runtime receives the derived actor id, never a client-supplied one', async () => {
+    await invoke({ prompt: 'Where should I go?', actorId: 'someone-else' });
+    const payload = JSON.parse(new TextDecoder().decode(lastInput.payload));
+    assert.equal(payload.actorId, deriveActorId(SUB));
+  });
+
+  // A session holds one conversation; an actor holds everything the agent ever learned
+  // about a person. The attempt has to be on record, not merely ineffective.
+  test('an attempt to supply an actorId is recorded as blocked', async () => {
+    const spans: any[] = [];
+    const original = console.error;
+    console.error = (line: string) => { try { spans.push(JSON.parse(line)); } catch { /* not a span */ } };
+    try {
+      await invoke({ prompt: 'Where should I go?', actorId: 'someone-else' });
+    } finally {
+      console.error = original;
+    }
+
+    const blocked = spans.find((s) => s.name === 'bff.client_supplied_identity');
+    assert.ok(blocked, 'expected a blocked span for the supplied actorId');
+    assert.equal(blocked.status, 'blocked');
+    assert.equal(blocked.attributes.suppliedActorId, true);
+  });
+});
 
 describe('session mapping', () => {
   test('derives a session id long enough for AgentCore', () => {

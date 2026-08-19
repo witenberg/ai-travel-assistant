@@ -170,6 +170,49 @@ Each of these cost a deploy cycle. None is guessable from the docs alone.
   with no such parent, so any check must copy the artifact out of the tree first —
   otherwise it reports a failure that will not happen, or misses one that will.
 
+## AgentCore Memory — traps found while wiring it up
+
+- **Every event carries an `actorId` *and* a `sessionId`, and `ListEvents` needs both.**
+  The actor is the person, the session is the conversation. Long-term namespaces are
+  keyed on the actor, so choosing to collapse the two is a decision you cannot cheaply
+  undo once records exist. We derive both from the same Cognito `sub` with different
+  domain separators — same source today, separable tomorrow.
+- **`eventExpiryDuration` bounds raw events only.** Extracted long-term records have
+  their own lifetime. That split is the point: the conversation is cheap to forget, the
+  lesson is not.
+- **Strategies run under a separate `MemoryExecutionRoleArn`**, not the runtime role —
+  extraction happens on AWS's schedule, outside our container. Its `bedrock:InvokeModel`
+  policy has to be wider than the runtime's, because AWS picks the extraction model. A
+  policy pinned to our inference profile would fail *silently*, as a strategy that quietly
+  stops producing records.
+- **`ListEvents` promises no order.** A reversed history is worse than none — the model
+  reads every answer before its question. Sort by `eventTimestamp` yourself.
+- **Converse rejects a message list that does not strictly alternate from `user`,** and
+  rejects the whole turn. One half-written event would therefore poison every later turn
+  in that session permanently, so `alternating()` drops what breaks the pattern instead
+  of forwarding it.
+- **Adding a strategy to an existing `CfnMemory` updates in place** — `cdk diff` showed
+  `[~]`, not a replacement, so the memory id and its stored events survive.
+- **Long-term extraction is asynchronous — a few minutes after the turn.** Immediately
+  after a two-turn conversation `retrieve-memory-records` returned `[]`; the same query a
+  few minutes later returned two correct preference records. An empty namespace right
+  after a turn proves nothing, in either direction.
+- **`list-memory-extraction-jobs` returned `[]` the whole time, including after extraction
+  had demonstrably run.** It appears to list only jobs started explicitly with
+  `StartMemoryExtractionJob`, not the strategy's own scheduled runs. An empty job list is
+  therefore not a signal, and reading it as one nearly cost us a wrong conclusion about a
+  working strategy.
+- **A `USER_PREFERENCE` record stores serialised JSON, not prose:**
+  `{"context": ..., "preference": ..., "categories": [...]}`. Only `preference` belongs in
+  the prompt — `context` restates the turn it came from and `categories` are retrieval
+  metadata, so passing `content.text` straight through spends three fields of tokens on
+  one field of meaning, on every turn. `preferenceText()` unwraps it and falls back to the
+  raw string, because the shape is AWS's to change.
+- **Recall costs ~0.5 s per turn, and it is the search that costs it.** Measured from the
+  spans: `memory.load_history` 81–119 ms and `memory.load_preferences` 338–370 ms run
+  concurrently, then `memory.save_turn` 110–131 ms. Against ADR-0001's ~29 s ceiling this
+  is affordable, but it is the first thing on the critical path that is not a model call.
+
 ## Tool design principles
 
 Lessons from the first iteration, each paid for with a real agent failure:
@@ -225,6 +268,7 @@ guardrail that stays. We deploy through the CDK bootstrap roles (variant B in
 | Memory | `travel_assistant_memory-Np64SnHkoA` |
 | Credential provider | `token-vault/default/apikeycredentialprovider/duffel-api-key` |
 | Cognito | `us-east-1_WuhBjq1L7`, machine client `2499r5au4tmahnuon9daeruiid` |
+| Memory strategy | `travel_preferences-6n4o2nBeG6` (`USER_PREFERENCE`), namespace `/preferences/{actorId}` |
 | Log group | `/aws/bedrock-agentcore/runtimes/travel_assistant-m6PLoMGxv5-DEFAULT` |
 | API | `https://ef1qmnowze.execute-api.us-east-1.amazonaws.com/v1/chat` |
 | Lambda BFF | `travel-assistant-bff`, log group `/aws/lambda/travel-assistant-bff` |
@@ -238,6 +282,12 @@ least 33 characters. Payload is `{"prompt": "...", "scopes": [...]}` base64-enco
 **Still a placeholder:** the Duffel secret holds `REPLACE_ME`, and the tool does not yet
 read from the Identity token vault, so `search_flights` fails in the cloud. The other
 three tools work.
+
+**Memory is wired in and verified (ADR-0003):** short-term history works end to end in
+the cloud — a follow-up question with no place name in it was answered with the place
+name from the previous turn, and both turns read back from `list-events`. Long-term
+extraction is live but has produced no records yet; see ROADMAP step 5. The DynamoDB
+table is now the one resource nothing touches — ROADMAP step 6 decides its fate.
 
 **Workflow note:** `cdk deploy` is blocked by the auto-mode classifier — Jakub must run
 that one command himself with the `!` prefix. `synth`, `diff` and `destroy` go through
@@ -263,6 +313,17 @@ the interesting part. Full statement in `README.md`.
   one turn costs roughly 1 US cent, so the worst case is capped near 1 USD a day.
   The BFF derives `sessionId` from a sha256 of the token's `sub` and never reads a
   client-supplied one — that mapping is the entire reason the component exists.
+
+- **ADR-0003** — AgentCore Memory is on. Short-term stores the turn's *text* (one event
+  per turn, question and answer together), never the Converse `Message[]` with its tool
+  blocks: a mismatched `toolUseId` would break every later turn in that session, and tool
+  traffic is both the bulk of the tokens and noise to the extraction strategies. History
+  is capped at 10 turns because replayed history is billed on every subsequent turn —
+  uncapped, conversation cost grows with length, which no per-request throttle can see.
+  Long-term uses one `USER_PREFERENCE` strategy in namespace `/preferences/{actorId}`,
+  keyed on the **actor** rather than the session so what the agent learns outlives any
+  one conversation. Rejected: a `SUMMARY` strategy, which would pay a model to re-store
+  forecasts `get_weather` fetches fresher and for free.
 
 - **ADR-0002** — the Duffel token is stored in Secrets Manager, registered as an
   AgentCore Identity API key credential provider, and fetched by the tool at runtime via

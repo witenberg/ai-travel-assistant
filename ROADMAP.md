@@ -17,7 +17,7 @@ aws cloudformation describe-stacks --stack-name TravelAssistantStack \
   --query 'Stacks[0].StackStatus' --output text     # or "does not exist" if destroyed
 
 cd /Users/jakub.wi/Desktop/ai_app
-npm test && npm run typecheck                # 52 tests must pass
+npm test && npm run typecheck                # 80 tests must pass
 ```
 
 If the stack is gone, redeploy takes ~3 minutes:
@@ -37,6 +37,8 @@ Docker Desktop must be running before any deploy that rebuilds the image.
 - Scope enforcement locally via `src/guard.ts`, with a `blocked` span
 - Entry layer: API Gateway (Cognito authorizer, API key, usage plan, throttling) and the
   Lambda BFF — deployed and verified, see Step 3
+- Memory: short-term history — deployed and verified in the cloud, see Step 5.
+  Long-term preference extraction is built and live but has produced no records yet
 - `Session → trace → span` reaching CloudWatch from the deployed Runtime
 - One CDK stack: Cognito, DynamoDB, Secrets Manager, Identity credential provider,
   Memory, Runtime, log group
@@ -46,8 +48,7 @@ Docker Desktop must be running before any deploy that rebuilds the image.
   `DUFFEL_ACCESS_TOKEN` from the environment instead of the Identity token vault.
 
 **Created but unused:**
-- AgentCore Memory — `MEMORY_ID` is passed to the container and ignored
-- DynamoDB table — no code touches it
+- DynamoDB table — no code touches it (step 6 decides its fate)
 
 **Not built:**
 - AgentCore Gateway with tool targets
@@ -268,19 +269,84 @@ our code, and the deployed agent still answers correctly with tools it is allowe
 
 ---
 
-## Step 5 — Memory
+## Step 5 — Memory — **DONE, VERIFIED IN THE CLOUD (2026-08-19)**
 
-**Why:** Memory is deployed and ignored, which is both a waste and a gap in the learning
-goals. It is also what makes the assistant feel like an assistant.
+Design and rationale: [ADR-0003](docs/adr/0003-memory-keyed-on-actor-not-session.md).
+Deployed in 189 s; the Memory resource updated **in place** as `cdk diff` predicted, so
+`travel_assistant_memory-Np64SnHkoA` and its stored events survived.
 
-- Short-term: persist turns per session, load history on invocation. `src/agent.ts`
-  already accepts a `history` parameter designed for this.
-- Long-term: extract preferences (favourite destinations, budget style) into strategies
-- Memory has `MemoryStrategies` and `IndexedKeys` in CloudFormation — worth reading
-  before designing the schema
+**Verified in the cloud** — `./scripts/smoke-memory.sh`:
 
-**Verify:** two invocations with the same session id; the second answers a question that
-only makes sense given the first ("and what about the weather there?").
+| Check | Result |
+|---|---|
+| Strategy live | `travel_preferences-6n4o2nBeG6`, `USER_PREFERENCE`, `ACTIVE` |
+| Follow-up with no place name | "the weather like **there**" answered "This weekend in **Lisbon**" |
+| Events actually written | both turns read back from `list-events`, question paired with answer |
+| Spans in CloudWatch | `memory.load_history` / `load_preferences` / `save_turn`, `ok`, on both traces |
+
+The place name in the second answer can only have come from history — that is the whole
+test. The `list-events` read is what makes it evidence rather than a plausible answer.
+
+**Measured latency added per turn** (from the spans, not estimated): `load_history`
+81–119 ms and `load_preferences` 338–370 ms run concurrently, `save_turn` 110–131 ms
+follows. About **0.5 s** on a path whose ceiling is ~29 s (ADR-0001). Recall is the
+expensive half — semantic search, not the event read.
+
+**Long-term extraction works too**, a few minutes after the conversation. From the two
+turns above the strategy produced:
+
+```
+"Interested in visiting Lisbon, Portugal for a short holiday"
+"Likes to check weather conditions when planning travel"
+```
+
+Two traps found here, both now in `CLAUDE.md`:
+
+- `list-memory-extraction-jobs` returned `[]` the entire time, *including after extraction
+  had demonstrably run*. It seems to list only jobs started with `StartMemoryExtractionJob`.
+  An empty job list is not a signal — reading it as one almost produced a wrong conclusion.
+- A record's `content.text` is **serialised JSON**, not prose:
+  `{"context": ..., "preference": ..., "categories": [...]}`. Only `preference` belongs in
+  the prompt. `preferenceText()` unwraps it, with a fallback to the raw string.
+
+**One redeploy outstanding.** `preferenceText()` was written after the verification run,
+so the container in the cloud still injects the whole JSON blob. Harmless but wasteful;
+it goes out with the next deploy.
+
+**What was built**
+
+- `src/memory/store.ts` — a `MemoryStore` seam with two implementations, for the same
+  reason `guard.ts` mirrors the Gateway: `NullMemoryStore` is what `npm run dev` uses, so
+  a local run behaves like the deployed one minus recall rather than crashing.
+- Short-term: one `CreateEvent` per turn carrying question and answer together; history
+  read back with `ListEvents`, sorted by timestamp, capped at 10 turns.
+- Long-term: one `USER_PREFERENCE` strategy in `/preferences/{actorId}`, retrieved with
+  `RetrieveMemoryRecords` using the user's message as the search query, and rendered into
+  the system prompt **labelled as possibly stale**.
+- `actorId` split from `sessionId` — the person versus the conversation. Both derive from
+  the same `sub` today; the split is what makes a real per-conversation session id a
+  BFF-only change later.
+- A `MemoryRole` for extraction, separate from the runtime role.
+- Memory failure degrades the agent instead of breaking it: empty recall on a read
+  failure, an answer still returned on a write failure, an `error` span either way.
+
+**Verify after deploy** — `./scripts/smoke-memory.sh`:
+
+1. "I am thinking about Lisbon…" then "What is the weather like **there** this weekend?"
+   The second question has no place name in it, so an answer naming Lisbon can only have
+   come from history.
+2. The script then reads the events back with `list-events`, because a right-looking
+   answer is not evidence that anything was written.
+3. Long-term records are extracted **asynchronously** — minutes, not seconds. An empty
+   `retrieve-memory-records` immediately after a turn is expected, not a failure. The
+   script prints the command to re-check later.
+
+**Cost note:** the new spend is mostly replayed history, not Memory itself. A long
+conversation roughly doubles input tokens per turn, so the 100 requests/day quota now
+caps the worst case nearer 2 USD/day than 1.
+
+**Not done here:** conversation rotation (there is no "new chat" concept), and pruning
+old sessions — `eventExpiryDuration: 7` handles that for us.
 
 ---
 
