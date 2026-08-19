@@ -92,30 +92,26 @@ export class TravelAssistantStack extends Stack {
       removalPolicy: RemovalPolicy.DESTROY,
     });
 
-    /**
-     * With `apiKeySecretSource: EXTERNAL` the secret stays ours and AgentCore Identity
-     * reads its value at request time — so Identity needs permission on the secret, and a
-     * service principal has no identity policy in our account to grant it. Hence a
-     * resource policy on the secret rather than a role.
+    /*
+     * No resource policy on this secret, and the reason is the most surprising thing we
+     * learned in this step: with `apiKeySecretSource: EXTERNAL`, AgentCore Identity reads
+     * the secret **as the calling workload**, not as itself. The AccessDenied it returned
+     * named our own runtime execution role —
+     *   User: .../TravelAssistantStack-RuntimeRole.../BedrockAgentCore-<uuid> is not
+     *   authorized to perform: secretsmanager:GetSecretValue ... because no identity-based
+     *   policy allows the action
+     * — so the fix is a grant on the runtime role (see `duffelSecret.grantRead` below), and
+     * a resource policy naming a service principal would have been beside the point.
      *
-     * The principal is `identity.bedrock-agentcore.amazonaws.com`. Note the asymmetry with
-     * everything else AgentCore: the runtime, memory and gateway roles are all assumed by
-     * `bedrock-agentcore.amazonaws.com`, but the token vault reads secrets under its own
-     * per-capability principal.
-     *
-     * `aws:SourceAccount` is confused-deputy protection: without it, a credential provider
-     * in *any* AWS account could name this secret's ARN and have Identity read it out on
-     * their behalf. It is also the one condition in this change we have not seen confirmed
-     * in the docs — if `GetResourceApiKey` comes back AccessDenied, dropping this condition
-     * is the first thing to try.
+     * Which is just as well, because the documented one cannot be written. The AWS blog
+     * announcing the feature says to allow `identity.bedrock-agentcore.amazonaws.com`, and
+     * Secrets Manager rejects that principal outright, through CloudFormation and through
+     * `put-resource-policy` alike:
+     *   MalformedPolicyDocumentException: This resource policy contains an unsupported
+     *   service principal.
+     * Probed by hand, it accepts `bedrock-agentcore.amazonaws.com` and
+     * `runtime-identity.bedrock-agentcore.amazonaws.com` and rejects the documented one.
      */
-    duffelSecret.addToResourcePolicy(new iam.PolicyStatement({
-      principals: [new iam.ServicePrincipal('identity.bedrock-agentcore.amazonaws.com')],
-      actions: ['secretsmanager:GetSecretValue'],
-      resources: ['*'],
-      conditions: { StringEquals: { 'aws:SourceAccount': this.account } },
-    }));
-
     const duffelCredentials = new agentcore.CfnApiKeyCredentialProvider(this, 'DuffelCredentials', {
       name: 'duffel-api-key',
       apiKeySecretSource: 'EXTERNAL',
@@ -203,6 +199,21 @@ export class TravelAssistantStack extends Stack {
       actions: ['bedrock-agentcore:GetWorkloadAccessToken', 'bedrock-agentcore:GetResourceApiKey'],
       resources: ['*'],
     }));
+
+    /*
+     * And the read of the secret behind that credential provider, because `GetResourceApiKey`
+     * performs it under *this* role rather than under a service principal of its own —
+     * proved by the AccessDenied it returned, which named this role's session.
+     *
+     * This qualifies ADR-0002 rather than contradicting it. The Identity layer no longer
+     * hides Secrets Manager from the container's IAM; what it still does is keep the secret's
+     * ARN out of the container, keep the fetch to one audited API per credential provider,
+     * and leave the same code path working for an OAuth 2 provider where there is no secret
+     * to read at all. If the goal were the container holding no Secrets Manager permission,
+     * the answer is a service-managed secret (drop `apiKeySecretSource: EXTERNAL` and let
+     * AgentCore own it) — at the price of the secret's lifecycle leaving our stack.
+     */
+    duffelSecret.grantRead(runtimeRole);
 
     // Memory data plane. Scoped to this one memory resource: the runtime has no business
     // reading events from any other, and `*` here would make cross-actor recall a policy
@@ -518,8 +529,14 @@ export class TravelAssistantStack extends Stack {
     // Scoped to this runtime and its endpoints. `InvokeAgentRuntime` on "*" would let the
     // BFF call any agent in the account, which is exactly the blast radius we can avoid
     // for free here.
+    // `InvokeAgentRuntimeForUser` is a second action guarding one field: it is required
+    // when the request carries `runtimeUserId`, which is how the BFF makes AgentCore mint
+    // a workload access token for the container (ADR-0002, and see the comment in
+    // src/bff/handler.ts). The docs' matching advice is to keep the permission narrow,
+    // because the user id itself is unverified — this holder is the one component that
+    // derives it from a token API Gateway has already validated.
     bff.addToRolePolicy(new iam.PolicyStatement({
-      actions: ['bedrock-agentcore:InvokeAgentRuntime'],
+      actions: ['bedrock-agentcore:InvokeAgentRuntime', 'bedrock-agentcore:InvokeAgentRuntimeForUser'],
       resources: [
         runtime.attrAgentRuntimeArn,
         `${runtime.attrAgentRuntimeArn}/runtime-endpoint/*`,

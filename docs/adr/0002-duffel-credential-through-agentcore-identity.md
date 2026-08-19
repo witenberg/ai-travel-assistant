@@ -57,3 +57,41 @@ half of the diagram we lost when Amadeus shut down its self-service portal.
   way the Amadeus OAuth token was.
 - The Gateway-injected route stays available as a later demonstration; we may add a
   second, trivial target purely to show it.
+
+## Addendum (2026-08-19) — what the deployed chain taught us
+
+The decision stands, and two of its premises turned out to be wrong. Recorded here rather
+than quietly fixed, because both were reasonable readings of the documentation.
+
+**A workload access token arrives only if the invocation names a user.** The docs say
+Runtime "passes the workload access token to agent code as part of the invocation payload
+header", and it does — but the delivery runs through `GetWorkloadAccessTokenForJWT`, which
+needs an end user, and a SigV4 `InvokeAgentRuntime` names none. Measured from inside the
+container, a plain invocation carries no token header of any kind. Supplying
+`runtimeUserId` switches AgentCore to the `GetWorkloadAccessTokenForUserId` path, and the
+token appears. The value is the actor id the BFF already derives from the verified JWT,
+which is what AWS's own guidance requires: the platform treats the user id as an
+unverified opaque string, so its integrity has to come from the component that sets it.
+Cost: one extra IAM action on the BFF role, `InvokeAgentRuntimeForUser`.
+
+**`GetResourceApiKey` reads an `EXTERNAL` secret as the calling workload, not as itself.**
+Its AccessDenied named our own runtime execution role. So the runtime role needs
+`secretsmanager:GetSecretValue` on the secret, and the resource policy the feature's launch
+blog prescribes — allowing `identity.bedrock-agentcore.amazonaws.com` — is both beside the
+point and impossible to write, since Secrets Manager rejects that principal as unsupported.
+
+That qualifies one of the consequences above. The container *does* end up holding a Secrets
+Manager permission, so the Identity layer is not what keeps the secret away from the
+container's IAM. What it still buys:
+
+- the secret's ARN never enters the container, and the container never calls Secrets Manager
+  itself — it names a credential provider, and the vault decides;
+- one audited API per credential provider, so access is attributable to a provider rather
+  than to a secret read;
+- the same code path works for an OAuth 2 provider, where there is no secret to read at all —
+  which is the transfer this ADR was chosen for.
+
+If "the container holds no Secrets Manager permission" were the requirement, the answer is a
+service-managed secret: drop `apiKeySecretSource: EXTERNAL` and let AgentCore own the secret,
+at the price of its lifecycle leaving our stack. We keep BYOS because the secret's lifecycle
+being ours is worth more here than one IAM statement.

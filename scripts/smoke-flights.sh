@@ -67,6 +67,11 @@ RESPONSE=$(curl -sS -X POST "$API_URL" \
 echo "$RESPONSE" | python3 -c 'import sys,json; d=json.load(sys.stdin); print("   ", d.get("response","")[:800]); print("    toolCalls:", d.get("toolCalls"))'
 
 echo "==> 2/3  which header carried the workload access token (once per container)"
+# Empty output here is normal on a warm container: the line is written once per process, so
+# a container already serving this session logged it before this run. To see it, force a cold
+# container with a session id nothing has used yet:
+#   aws bedrock-agentcore invoke-agent-runtime --runtime-session-id <fresh 33+ chars> \
+#     --runtime-user-id u-probe ...
 sleep 12   # log delivery lags the call by a few seconds; an empty result here means "not yet"
 aws logs filter-log-events --profile "$PROFILE" --log-group-name "$LOG_GROUP" \
   --start-time "$SINCE" --filter-pattern '{ $.event = "invocation_headers" }' \

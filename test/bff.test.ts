@@ -67,6 +67,14 @@ describe('actor mapping', () => {
     assert.equal(payload.actorId, deriveActorId(SUB));
   });
 
+  // `runtimeUserId` is what makes AgentCore mint a workload access token for the container,
+  // and AWS treats the value as an unverified opaque string — so the guarantee has to come
+  // from us deriving it. Same value as the actor id: credentials and memories, one identity.
+  test('the invocation names the user, derived from the token rather than the body', async () => {
+    await invoke({ prompt: 'Flights to Lisbon?', actorId: 'someone-else' });
+    assert.equal(lastInput.runtimeUserId, deriveActorId(SUB));
+  });
+
   // A session holds one conversation; an actor holds everything the agent ever learned
   // about a person. The attempt has to be on record, not merely ineffective.
   test('an attempt to supply an actorId is recorded as blocked', async () => {

@@ -17,7 +17,7 @@ aws cloudformation describe-stacks --stack-name TravelAssistantStack \
   --query 'Stacks[0].StackStatus' --output text     # or "does not exist" if destroyed
 
 cd /Users/jakub.wi/Desktop/ai_app
-npm test && npm run typecheck                # 144 tests must pass
+npm test && npm run typecheck                # 161 tests must pass
 npm run verify:bundle                        # after any cdk synth, before any deploy
 ```
 
@@ -38,17 +38,15 @@ Docker Desktop must be running before any deploy that rebuilds the image.
 - Scope enforcement locally via `src/guard.ts`, with a `blocked` span
 - Entry layer: API Gateway (Cognito authorizer, API key, usage plan, throttling) and the
   Lambda BFF — deployed and verified, see Step 3
-- Memory: short-term history — deployed and verified in the cloud, see Step 5.
-  Long-term preference extraction is built and live but has produced no records yet
+- Memory: short-term history and long-term preference extraction — deployed and verified
+  in the cloud, see Step 5
 - AgentCore Gateway: the three keyless tools served over MCP by a Lambda target, with a
   REQUEST interceptor enforcing scopes per tool call — deployed and verified, see Step 4
 - `Session → trace → span` reaching CloudWatch from the deployed Runtime
+- `search_flights` (Duffel) with its key read from the AgentCore Identity token vault —
+  deployed and verified, see Step 2
 - One CDK stack: Cognito, DynamoDB, Secrets Manager, Identity credential provider,
-  Memory, Runtime, log group
-
-**Built but not working in the cloud:**
-- `search_flights` (Duffel). The secret still holds `REPLACE_ME` and the tool reads
-  `DUFFEL_ACCESS_TOKEN` from the environment instead of the Identity token vault.
+  Memory, Runtime, Gateway, log groups
 
 **Created but unused:**
 - DynamoDB table — no code touches it (step 6 decides its fate)
@@ -93,33 +91,55 @@ returns 0.
 
 ---
 
-## Step 2 — Duffel token from the Identity token vault
+## Step 2 — Duffel token from the Identity token vault — **DONE, VERIFIED IN THE CLOUD (2026-08-19)**
 
-Finishes [ADR-0002](docs/adr/0002-duffel-credential-through-agentcore-identity.md).
+Finishes [ADR-0002](docs/adr/0002-duffel-credential-through-agentcore-identity.md), whose
+addendum records the two premises this step disproved.
 
-**Open unknown, resolve this first:** how does code inside the Runtime obtain its
-workload access token? `GetWorkloadAccessToken` called from outside fails with
-*"WorkloadIdentity is linked to a service and cannot retrieve an access token by the
-caller"*, so the chain cannot be tested from the CLI. The Runtime already has a workload
-identity: `workload-identity-directory/default/workload-identity/travel_assistant-m6PLoMGxv5`.
-Likely the container receives a token through an environment variable or a local
-endpoint; the Python AgentCore SDK hides this behind `@requires_api_key`. Find the
-mechanism before writing code — check the runtime's own environment by logging
-`process.env` keys once from inside the container.
+**Verified end to end** — `./scripts/smoke-flights.sh`:
 
-**Then:**
-- Put the real token into the secret:
-  `aws secretsmanager put-secret-value --secret-id <DuffelSecretArn> --secret-string '{"token":"duffel_test_..."}'`
-- Add a credential-source seam to `src/tools/duffel/client.ts`: environment variable
-  locally, `GetResourceApiKey` in the Runtime. Cache the key in module scope.
-  API shape: `get-resource-api-key --workload-identity-token <t> --resource-credential-provider-name duffel-api-key`
-- The Runtime role already holds `GetWorkloadAccessToken` and `GetResourceApiKey`
+| Check | Result |
+|---|---|
+| Secret holds a real token | `duffel_test_…`, 55 chars, written with `put-secret-value` and never through CDK |
+| The agent answered with real flights | five offers London→Lisbon, €84.65–€123.91, durations formatted by the tool |
+| The key came from the vault | `{"event":"duffel.credential","source":"identity"}`, then `"source":"cache"` on the second call |
+| The tool really ran | `tool.execute`, `search_flights`, `ok`, 2104 ms |
+| Which header carried the token | `x-amz-bedrock-agentcore-identity-wat` — and two more names alongside it |
 
-**Verify:** invoke the deployed Runtime with a flights question; the answer contains real
-prices and the log group shows a `tool.execute` span for `search_flights`.
+**Three deploys, and each failure moved the answer forward** — all of it now in `CLAUDE.md`
+under "AgentCore Identity, outbound auth":
 
-**Watch for:** never log the retrieved key. There is already a test asserting that a 401
-body is not echoed — keep that property.
+1. *Secrets Manager rejected the resource policy the AWS launch blog prescribes.* The principal
+   `identity.bedrock-agentcore.amazonaws.com` is "unsupported"; `bedrock-agentcore.amazonaws.com`
+   and `runtime-identity.bedrock-agentcore.amazonaws.com` are accepted. Probed with
+   `put-resource-policy` in seconds rather than by deploying four times.
+2. *The container received no workload access token at all.* The header-name diagnostic proved
+   it — the delivery the docs describe needs an end user, and a SigV4 invocation names none.
+   Fixed with `runtimeUserId` on the invocation plus `InvokeAgentRuntimeForUser` on the BFF role.
+   The alternative, moving the Runtime to inbound JWT, would have rewritten the entry layer for
+   one header; it stays available and is the stronger option if a real human user appears.
+3. *`GetResourceApiKey` read the secret as our own runtime role*, which its AccessDenied named.
+   One `grantRead` fixed it — and explained why step 1's resource policy was beside the point.
+
+**What was built**
+
+- `src/identity/workloadToken.ts` — picks the token off the invocation and scopes it to the turn
+  with `AsyncLocalStorage`. Not a parameter, because it would have added an identity concern to
+  four signatures that have no other reason to know about it; not module state, because two
+  overlapping turns would then see each other's token. There is a test for that.
+- `src/identity/apiKey.ts` — `GetResourceApiKey`, cached per container, dropped on a 401 so a
+  secret rotated mid-session cannot poison every later turn.
+- `src/tools/duffel/client.ts` — the credential is a seam now: environment variable locally, vault
+  in the Runtime, and it logs *which* source served the key. An answer looks identical either way,
+  so without that line "it works" would not distinguish the vault from a leftover variable.
+- `scripts/smoke-flights.sh`, and the header-name diagnostic that answered the open unknown.
+
+**Watch for:** the diagnostic is written once per container, so on a warm container it prints
+nothing after a code change. A fresh `--runtime-session-id` forces a cold one.
+
+**Not done here:** the Duffel token is static, so this exercises the *API key* half of the
+diagram's `outbound (API key / OAuth 2)` edge. `get-resource-oauth2-token` has the same shape,
+which is what ADR-0002 chose this route for.
 
 ---
 

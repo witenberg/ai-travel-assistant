@@ -177,6 +177,26 @@ export function createHandler(deps: HandlerDeps = {}) {
           agentRuntimeArn: runtimeArn,
           qualifier,
           runtimeSessionId: sessionId,
+          /*
+           * What makes AgentCore hand the container a workload access token.
+           *
+           * Measured, not assumed: with plain `InvokeAgentRuntime` the container received
+           * only `accept`, `baggage`, `content-*`, `host`, the session id, `x-amzn-requestid`
+           * and `x-amzn-trace-id` — no token of any kind. The automatic delivery the docs
+           * describe runs `GetWorkloadAccessTokenForJWT`, which needs an end user, and a
+           * SigV4 invocation names none. `runtimeUserId` supplies one, and AgentCore then
+           * takes the `GetWorkloadAccessTokenForUserId` path and injects the result.
+           *
+           * The value is the actor id, and that is the whole security argument: AWS treats
+           * this string as opaque and unverified, so the docs require it be derived from the
+           * authenticated principal rather than accepted from the caller. Ours is a sha256
+           * of the token's `sub` — the same derivation that owns long-term memory, so the
+           * agent's credentials and its memories are bound to one identity by construction.
+           *
+           * Costs the caller role `bedrock-agentcore:InvokeAgentRuntimeForUser` on top of
+           * `InvokeAgentRuntime`.
+           */
+          runtimeUserId: actorId,
           contentType: 'application/json',
           accept: 'application/json',
           payload: new TextEncoder().encode(

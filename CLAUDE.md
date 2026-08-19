@@ -287,6 +287,52 @@ or against `cdk synth`, not remembered.
   `logs:CreateLogGroup` for the same reason the Runtime did. We declare the group in CDK so
   it expires and so `cdk destroy` removes it.
 
+## AgentCore Identity, outbound auth — facts paid for in deploys
+
+Built in ROADMAP step 2, design and its two wrong premises in ADR-0002. Every line here was
+measured in the cloud; the docs alone would have produced a different, non-working design.
+
+- **A workload access token reaches the container only if the invocation names a user.** With
+  plain SigV4 `InvokeAgentRuntime` the container received `accept`, `baggage`, `content-*`,
+  `host`, the session id, `x-amzn-requestid`, `x-amzn-trace-id` — **no token header at all**.
+  The automatic delivery the docs describe runs `GetWorkloadAccessTokenForJWT`, which needs an
+  end user. Passing `runtimeUserId` on the invocation switches AgentCore to the
+  `GetWorkloadAccessTokenForUserId` path and the token appears. It costs the caller role
+  `bedrock-agentcore:InvokeAgentRuntimeForUser` on top of `InvokeAgentRuntime`.
+- **With a user named, AgentCore injects the token under three different header names:**
+  `workloadaccesstoken`, `x-amz-bedrock-agentcore-identity-wat` and
+  `x-amzn-bedrock-agentcore-runtime-workload-accesstoken`. The Python SDK's constants name only
+  the first two, so a client that knows just one name is fine — but only by luck. We read the
+  `identity-wat` one and fall back to `workloadaccesstoken`.
+- **AWS treats `runtimeUserId` as an unverified opaque string**, so its integrity is entirely
+  ours to provide. We pass the actor id derived from the token's `sub` — the same id that owns
+  long-term memory, which binds an agent's credentials and its memories to one identity by
+  construction. A client-supplied value would be horizontal privilege escalation into another
+  user's stored credentials, so the BFF is the only component allowed to set it.
+- **A runtime-managed workload identity cannot fetch its own token, by design.** "Runtime-managed
+  and Gateway-managed workload identities cannot retrieve tokens directly. This prevents agents
+  from extracting tokens for misuse." So the CLI error *"WorkloadIdentity is linked to a service
+  and cannot retrieve an access token by the caller"* is permanent — there is no fallback to
+  `GetWorkloadAccessToken` worth writing.
+- **`GetResourceApiKey` reads an `EXTERNAL` secret as the *calling workload*, not as a service
+  principal of its own.** Its AccessDenied named our runtime execution role by ARN, so the fix is
+  `secretsmanager:GetSecretValue` on the runtime role. This qualifies ADR-0002: with BYOS the
+  container does hold a Secrets Manager permission.
+- **The resource policy the feature's launch blog prescribes cannot be written.** It says to allow
+  `identity.bedrock-agentcore.amazonaws.com`; Secrets Manager rejects that principal in
+  CloudFormation and in `put-resource-policy` alike — *"This resource policy contains an
+  unsupported service principal."* Probed by hand: `bedrock-agentcore.amazonaws.com` and
+  `runtime-identity.bedrock-agentcore.amazonaws.com` are accepted, the documented one is not.
+  Since the read happens as the caller, no resource policy is needed at all.
+- **`update-api-key-credential-provider` succeeds with no read access to the secret**, so the
+  control plane validates nothing about the secret at write time. A provider that reads back fine
+  from `get-api-key-credential-provider` still tells you nothing about whether the key can be
+  fetched.
+- **A once-per-container diagnostic is invisible on a warm container.** The header-name line is
+  logged once per process, so after a code change the running container for an existing session
+  never prints the new information. A fresh session id forces a cold container:
+  `aws bedrock-agentcore invoke-agent-runtime --runtime-session-id <new 33+ chars> --runtime-user-id ...`.
+
 ## Tool design principles
 
 Lessons from the first iteration, each paid for with a real agent failure:
@@ -363,9 +409,11 @@ request**, both decisions appear as spans in the interceptor's log group carryin
 session id, and the end-to-end turn answered with the forecast plus an honest refusal about
 photos in 8.3 s.
 
-**Still a placeholder:** the Duffel secret holds `REPLACE_ME`, and the tool does not yet
-read from the Identity token vault, so `search_flights` fails in the cloud. The other
-three tools work.
+**Outbound auth is deployed and verified (ADR-0002, ROADMAP step 2).** The Duffel secret holds
+a real test token, and `search_flights` reads its key from the AgentCore Identity token vault
+in the cloud: `./scripts/smoke-flights.sh` returned five real offers with prices, a
+`duffel.credential` diagnostic with `"source":"identity"`, and a `tool.execute` span
+`ok` in 2104 ms. All four tools now work in the cloud.
 
 **Memory is wired in and verified (ADR-0003):** short-term history works end to end in
 the cloud — a follow-up question with no place name in it was answered with the place
@@ -433,10 +481,11 @@ the interesting part. Full statement in `README.md`.
 
 ## Open questions
 
-- [ ] Nothing blocking. The Gateway target question is answered in ADR-0004 (three tools
-      move, `search_flights` stays). What is genuinely unresolved is still Step 2: how code
-      inside the Runtime obtains its workload access token, which is what `search_flights`
-      needs to read the Duffel key from the token vault.
+- [ ] Nothing blocking. Step 2's unknown is answered: the token arrives as a request header,
+      but only when the invocation carries `runtimeUserId` (see the Identity section above).
+      What is left is a judgement call, not a blocker — whether the Runtime should move to
+      inbound JWT so the user's identity is proved cryptographically rather than asserted by
+      the BFF. Worth an ADR if a real human user ever replaces the machine client.
 
 ## Outbound auth — `search_flights`
 
