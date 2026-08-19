@@ -337,6 +337,60 @@ measured in the cloud; the docs alone would have produced a different, non-worki
   never prints the new information. A fresh session id forces a cold container:
   `aws bedrock-agentcore invoke-agent-runtime --runtime-session-id <new 33+ chars> --runtime-user-id ...`.
 
+## Gateway interceptors — the RESPONSE point, paid for in four deploys
+
+The FigJam board draws `interceptors inbound` **and** `interceptors outbound`. The outbound one
+is `src/gateway/responseInterceptor.ts`, and its job is not decoration: AgentCore forwards no
+session id to a target and our `x-travel-session-id` header reaches interceptors but not
+targets, so this is the only place a tool's *result* and the conversation that asked for it
+meet. It observes and never transforms.
+
+- **A gateway takes at most one interceptor per point**, and one Lambda could serve both. Ours
+  are two functions on purpose: REQUEST is a security control whose failure must deny a tool
+  call, RESPONSE is telemetry whose failure must cost nothing but a span. Sharing a function
+  would let a bug in observability refuse tool calls.
+- **`{"interceptorOutputVersion":"1.0","mcp":{}}` is NOT pass-through for an MCP target.** The
+  empty-object rule in the docs is written for **HTTP** targets. Returning it made the gateway
+  answer every call with an empty body — `tools/list` and `tools/call` both came back `{}` —
+  while the interceptor's own spans showed the calls succeeding. Echo an identity transform
+  instead: `transformedGatewayResponse` with the `statusCode` and `body` you were handed.
+- **Response headers never arrive.** `gatewayResponse.headers` is empty in practice even though
+  the docs' example shows headers, so there is nothing to echo — and echoing an empty object
+  would override the real ones. Harmless for this gateway, which assigns no `Mcp-Session-Id` at
+  all: verified by hand that `initialize` → `notifications/initialized` → `tools/list` works
+  with no session header anywhere.
+- **A denial reaches the RESPONSE interceptor too.** The docs say so for MCP targets: if the
+  REQUEST interceptor short-circuits with a `transformedGatewayResponse`, the RESPONSE
+  interceptor still runs. So the outbound span has to recognise `blocked: true` and record a
+  refusal as `blocked`, not as a tool that ran and failed — otherwise every denial reads as an
+  outage. (For HTTP targets the docs say the opposite: a short-circuit skips it.)
+- **The gateway may retry an interceptor**, so the docs ask for idempotency. A duplicated span
+  is a duplicated observation, not a duplicated effect, which is why writing one is safe here.
+
+## Verifying a deploy — the trap that cost three of them
+
+- **A session keeps its warm container across a deploy.** `idleRuntimeSessionTimeout` defaults
+  to **900 s**, and every re-run of a smoke script resets that timer, so "deploy, then verify"
+  can grade code that is not running. We now set `idleRuntimeSessionTimeout: 120` and
+  `maxLifetime: 3600`: the conversation lives in Memory, not in the container, so the only cost
+  is a cold start after a pause — and an idle container is billed for nothing. **A lifecycle
+  change applies to new sessions; the session already running keeps the old window**, so the old
+  container still has to age out before the API path can be trusted.
+- **The runtime answers with `build`**, the container image's asset tag, forwarded by the BFF and
+  printed by the smoke scripts. It is the only way to tell "the deploy worked" from "a container
+  from before the deploy answered me".
+- **Never do string arithmetic on a CDK token.** `image.imageUri.slice(-12)` at synth time slices
+  the *placeholder* and shipped `n[TOKEN.78]}` as the build id. Pass the whole token
+  (`image.imageTag`) and shorten it at runtime.
+- **A fresh session id forces a cold container**, and a direct invoke is the way to get one:
+  `aws bedrock-agentcore invoke-agent-runtime --runtime-session-id <fresh 33+ chars>
+  --runtime-user-id u-probe --payload <base64 with accessToken>`. The API path cannot do this,
+  because the BFF derives the session id from the token — which is the security control.
+- **`durationMs: 0` on a span that does I/O means no I/O happened.** That is how we found the MCP
+  client memoising a *rejected* handshake promise: one bad container start then failed every
+  later turn in that session, replaying the original error for free. A failed handshake must be
+  forgotten so the next turn retries.
+
 ## Tool design principles
 
 Lessons from the first iteration, each paid for with a real agent failure:
@@ -396,7 +450,7 @@ guardrail that stays. We deploy through the CDK bootstrap roles (variant B in
 | Log group | `/aws/bedrock-agentcore/runtimes/travel_assistant-m6PLoMGxv5-DEFAULT` |
 | Gateway | `travel-assistant-gateway-cxvsjwdkbj`, MCP endpoint `https://travel-assistant-gateway-cxvsjwdkbj.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp` |
 | Gateway target | `travel-tools` (id `ZO1C1YZ8PI`) — Lambda, three keyless tools |
-| Gateway Lambdas | `travel-assistant-gateway-interceptor`, `travel-assistant-gateway-tools` |
+| Gateway Lambdas | `travel-assistant-gateway-interceptor`, `travel-assistant-gateway-response-interceptor`, `travel-assistant-gateway-tools` |
 | API | `https://ef1qmnowze.execute-api.us-east-1.amazonaws.com/v1/chat` |
 | Lambda BFF | `travel-assistant-bff`, log group `/aws/lambda/travel-assistant-bff` |
 | Usage plan | `travel-assistant-plan` — 2 rps, burst 5, 100 requests/day |

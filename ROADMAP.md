@@ -481,6 +481,32 @@ in enough detail to implement in one sitting if that changes.
 
 ---
 
+## Step 9 — Outbound interceptor (the diagram's second interception point) — **DONE (2026-08-19)**
+
+The FigJam board draws `interceptors inbound` *and* `interceptors outbound`; only the inbound one
+existed. `src/gateway/responseInterceptor.ts` closes the second point, and it closes a real hole:
+the target Lambda cannot know the session id, so before this a tool's *result* had no way to be
+attached to the conversation that asked for it.
+
+**Verified** on a cold container, which after today is the only verification that counts:
+`gateway.tool.response` spans carrying our session id, `ok` for a granted call, `blocked` for a
+scope denial, plus `gateway.tools_list.response` with the catalogue size and the response size in
+bytes. The agent's turn answered with the forecast and refused photos honestly.
+
+**Four deploys, and the failures were all in the contract, not the logic** — every one is now in
+`CLAUDE.md` under "Gateway interceptors" and "Verifying a deploy":
+
+1. an empty `mcp` object is pass-through for HTTP targets only; on an MCP target it blanks the
+   response body while the interceptor's own spans report success,
+2. response headers never reach the interceptor, so there is nothing to echo,
+3. the MCP client memoised a *rejected* handshake, so one bad container start failed every later
+   turn in that session — `durationMs: 0` on an I/O span is what exposed it,
+4. and the reason all of this took four attempts: a session keeps its warm container for
+   `idleRuntimeSessionTimeout`, 900 s by default, so three deploys in a row were graded against
+   code that was not running. Now 120 s, plus a `build` field in every answer.
+
+---
+
 ## Step 8 — Deeper observability (optional)
 
 - CloudWatch Transaction Search plus ADOT gives the CloudWatch GenAI dashboard, service
