@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "tsx --env-file-if-exists=.env src/local.ts",
     "test": "tsx --env-file-if-exists=.env --test test/*.test.ts",
+    "test:offline": "tsx --env-file-if-exists=.env --test --test-skip-pattern='network' test/*.test.ts",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json",
     "serve": "tsx --env-file-if-exists=.env src/server.ts",

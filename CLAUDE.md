@@ -430,6 +430,11 @@ extraction produced two correct preference records a few minutes later; see ROAD
 that one command himself with the `!` prefix. `synth`, `diff` and `destroy` go through
 normally. We show `cdk diff` before every deploy anyway.
 
+**CI:** `.github/workflows/ci.yml`, see ADR-0006. Run the same checks locally before pushing:
+`npm run typecheck && npm run test:offline && (cd infra && npx cdk synth --quiet) && npm run verify:bundle`.
+`npm test` (161) includes six tests that call open-meteo, Wikipedia and Commons;
+`npm run test:offline` (155) is the CI gate and skips them.
+
 ## What to do next
 
 See [`ROADMAP.md`](ROADMAP.md) — remaining steps in order, each with its rationale,
@@ -443,6 +448,16 @@ budget allows. Application logic stays deliberately small so the infrastructure 
 the interesting part. Full statement in `README.md`.
 
 ## Decisions made
+
+- **ADR-0006** — CI runs on every pull request and stops at the edge of the AWS account:
+  `.env` must not be tracked, both typechecks, the offline tests, `cdk synth`, and
+  `verify:bundle`. No credentials, no `cdk diff`, no Docker — `cdk synth` does not build
+  image assets, which is what makes a Docker-free CI possible. **Deploying stays a human
+  action.** Rejected: deploy-on-merge, on three grounds — it needs `sts:AssumeRole` on the
+  bootstrap roles that only Paweł can grant, it turns a careless merge into spend on an
+  account with a hard cap and no cost telemetry, and it would skip the manual verification
+  that has caught something at every one of the six previous steps. The OIDC exit path is
+  written out in the ADR.
 
 - **ADR-0005** — the DynamoDB table is deleted; AgentCore Memory is the only state the system
   keeps. Nothing had ever read or written it: what the agent should remember about a person is

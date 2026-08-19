@@ -1,0 +1,83 @@
+# Continuous integration: everything that can be checked without an AWS account.
+#
+# What this catches, in the order the project has actually been bitten:
+#   - a Lambda bundle that synthesises fine and dies on load (the CJS/ESM lesson) —
+#     `verify:bundle` loads each artifact the way Lambda does
+#   - a template that no longer synthesises
+#   - a type error or a broken test
+#   - a committed `.env`, which would publish a live Duffel token
+#
+# What it deliberately does not do, and why:
+#   - **no `cdk deploy`.** Deployment is a human decision on a 10 USD budget; see ADR-0006.
+#   - **no `cdk diff`.** It needs credentials, and credentials in CI are exactly what we are
+#     not ready to grant yet — the CI role would need `sts:AssumeRole` on the CDK bootstrap
+#     roles, which only Paweł can grant (docs/blocker-iam.md).
+#   - **no container image build.** `cdk synth` does not build Docker image assets — the
+#     build happens at publish time, during `cdk deploy` — so CI gets the template for free.
+#     Building it here would mean an ARM64 image under QEMU emulation on an x64 runner:
+#     minutes per pull request to re-check something every deploy already checks.
+#   - **no network tests.** `test:offline` skips the suites that call open-meteo, Wikipedia
+#     and Wikimedia Commons. They are real tests worth keeping, but as a pull-request gate
+#     they would fail on someone else's outage, and a gate that cries wolf gets ignored.
+#     Run `npm test` locally for the full 161.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A new push supersedes the previous run on the same branch. Nothing here is worth
+# finishing twice.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Matches the runtime container (node:24-alpine). The Lambda bundles target
+          # node22 through an esbuild flag, which is independent of the Node running here.
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            infra/package-lock.json
+
+      - name: no secret file may be tracked
+        run: |
+          if git ls-files | grep -E '(^|/)\.env$'; then
+            echo "::error::.env is tracked by git — it holds a live Duffel token"
+            exit 1
+          fi
+
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      - run: npm run test:offline
+
+      - name: install infra dependencies
+        run: npm ci
+        working-directory: infra
+
+      - name: typecheck the infrastructure
+        run: npm run typecheck
+        working-directory: infra
+
+      - name: synthesise the stack
+        run: npx cdk synth --quiet
+        working-directory: infra
+
+      # Last, because it reads the artifacts the synth above produced in infra/cdk.out.
+      - name: the Lambda bundles must load the way Lambda loads them
+        run: npm run verify:bundle

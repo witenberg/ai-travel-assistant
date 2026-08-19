@@ -17,7 +17,7 @@ aws cloudformation describe-stacks --stack-name TravelAssistantStack \
   --query 'Stacks[0].StackStatus' --output text     # or "does not exist" if destroyed
 
 cd /Users/jakub.wi/Desktop/ai_app
-npm test && npm run typecheck                # 161 tests must pass
+npm test && npm run typecheck                # 161 tests must pass (155 offline)
 npm run verify:bundle                        # after any cdk synth, before any deploy
 ```
 
@@ -49,7 +49,8 @@ Docker Desktop must be running before any deploy that rebuilds the image.
   Gateway, log groups
 
 **Not built:**
-- CI/CD
+- Nothing on the original list. What remains is Step 8 (deeper observability), which was
+  optional from the start.
 
 **Removed from this roadmap (2026-08-19):** the two cost-telemetry steps — an AWS Budgets
 guardrail and a Cost Explorer reconciliation. Both are *explicitly denied* to
@@ -434,15 +435,52 @@ that belongs to the feature.
 
 ---
 
-## Step 7 — CI/CD
+## Step 7 — CI/CD — **DONE (2026-08-19): CI is in; CD stays manual by decision**
 
-Depends on Step 0 and a remote. The mentoring goals name CI/CD explicitly.
+Decision and rejected alternatives: [ADR-0006](docs/adr/0006-ci-verifies-humans-deploy.md).
 
-- On pull request: `npm test`, `npm run typecheck`, `cdk synth`
-- Deployment stays manual, or uses OIDC to assume the CDK `deploy` role
-- Note the constraint from `CLAUDE.md`: our identity has an explicit IAM deny and
-  deploys go through the bootstrap roles. Any CI role needs `sts:AssumeRole` on those,
-  granted by Paweł — the same conversation as `docs/blocker-iam.md`
+`.github/workflows/ci.yml` runs on every pull request and every push to `main`:
+
+| Step | What it protects against |
+|---|---|
+| `.env` must not be tracked | publishing a live Duffel token |
+| `npm run typecheck` (root and `infra`) | a type error reaching a deploy |
+| `npm run test:offline` — 155 tests | a logic or wiring regression |
+| `npx cdk synth` | a template that no longer synthesises |
+| `npm run verify:bundle` | a bundle that synthesises and then dies on load (the CJS lesson) |
+
+**Verified before committing**, by running the whole sequence locally with credentials made
+unavailable — `AWS_CONFIG_FILE=/dev/null AWS_SHARED_CREDENTIALS_FILE=/dev/null npx cdk synth`
+exited 0. So the workflow genuinely needs no AWS account, which is the property that lets it
+run on a repository nobody has granted anything to yet.
+
+**Two facts worth keeping:**
+
+- **`cdk synth` does not build container image assets.** CDK builds them at publish time,
+  during `cdk deploy`. That is what makes a Docker-free CI possible — otherwise every pull
+  request would build an ARM64 image under QEMU on an x64 runner.
+- **`npm run test:offline`** is `npm test` with `--test-skip-pattern='network'`, which drops
+  the six tests that call open-meteo, Wikipedia and Commons. They stay in `npm test` (161) and
+  run locally; as a merge gate they would fail on someone else's outage.
+
+**What is left for Jakub — attaching the remote.** Nothing in the workflow needs configuring
+afterwards; Actions picks it up on the first push.
+
+```bash
+cd /Users/jakub.wi/Desktop/ai_app
+gh repo create ai-travel-assistant --private --source=. --remote=origin --push
+# or, without gh:
+#   git remote add origin git@github.com:<user>/ai-travel-assistant.git
+#   git push -u origin main
+```
+
+Then open a throwaway pull request to watch the gate run, because a workflow that has never
+run is not a workflow that works — same principle as the rest of this file.
+
+**Deliberately not done: deploying from CI.** It needs `sts:AssumeRole` on the CDK bootstrap
+roles, which only Paweł can grant (`docs/blocker-iam.md`), and on a 10 USD account with no
+cost telemetry it would turn a careless merge into spend. ADR-0006 records the OIDC exit path
+in enough detail to implement in one sitting if that changes.
 
 ---
 
@@ -465,7 +503,7 @@ Depends on Step 0 and a remote. The mentoring goals name CI/CD explicitly.
 | ~~Lambda vs OpenAPI Gateway targets~~ | Decided in ADR-0004: Lambda target for the three keyless tools, `search_flights` stays in the Runtime |
 | ~~Whether the DynamoDB table survives~~ | Decided in ADR-0005: deleted |
 | Whether a frontend is ever built | Deferred; `curl` remains the interface |
-| Git remote and where CI runs | Step 0/7 |
+| ~~Git remote and where CI runs~~ | GitHub, decided 2026-08-19. CI is written and verified offline; Jakub attaches the remote (Step 7) |
 
 ## Rules that always apply
 
