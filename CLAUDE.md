@@ -321,6 +321,13 @@ Modern Anthropic models are reachable **only through inference profiles** (`us.`
 The cheapest model from a generation that handles tool calling reliably, and the tool
 logic here is simple. The model id is a parameter so swapping it is a one-line change.
 
+**No cost telemetry at all.** `budgets:ViewBudget` and `ce:GetCostAndUsage` are both
+*explicitly denied* to `MB-EmployeeAccess` (verified 2026-08-19), so we can neither set a
+budget alert nor read actual spend. Every cost control is preventive and architectural:
+the 100 requests/day API Gateway quota, the 2 rps throttle, on-demand billing, no
+always-on components, `cdk destroy` after every session. Lifting this is a request for
+Paweł, in the same conversation as `docs/blocker-iam.md`.
+
 **Bedrock pricing:** the AWS Price List API only carries legacy models and the pricing
 page is JS-rendered — **we have no confirmed Bedrock rates for 4.5+ models**. Anthropic
 first-party rates as an order of magnitude only (not the Bedrock price list):

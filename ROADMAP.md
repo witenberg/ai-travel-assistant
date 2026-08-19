@@ -83,7 +83,27 @@ returns 0.
 
 ---
 
-## Step 1 — Budget guardrail
+## Step 1 — Budget guardrail — **BLOCKED (2026-08-19), needs Paweł**
+
+Both routes are denied to `MB-EmployeeAccess`, by an *explicit deny* rather than a
+missing grant — so no amount of policy attachment on our side changes it:
+
+```
+budgets:ViewBudget  -> AccessDeniedException ... with an explicit deny in an identity-based policy
+ce:GetCostAndUsage  -> AccessDeniedException ... with an explicit deny in an identity-based policy
+```
+
+This is the same guardrail family as the IAM deny in `docs/blocker-iam.md`. Do not spend
+another session on it; it is a request for Paweł — either a budget created on his side
+with an alert to Jakub, or `ce:GetCostAndUsage` granted so we can read spend ourselves.
+
+**Consequence, and it matters:** we have *no* automated cost signal and no way to read
+actual spend. Every cost control is therefore architectural and preventive — the 100
+requests/day usage-plan quota, the 2 rps throttle, on-demand billing everywhere, no
+always-on components, and `cdk destroy` after each session. That also means Step 9
+(confirm real costs) cannot be done from this account at all until the deny is lifted.
+
+<details><summary>original notes</summary>
 
 **Why:** the account cap is 10 USD and nothing currently warns us. Every other step
 spends money. This is the only step that protects the others.
@@ -97,6 +117,8 @@ do not spend a session fighting it. Fallback: a CloudWatch billing alarm, or a m
 Cost Explorer check at the start of each session.
 
 **Verify:** the budget is listed by `aws budgets describe-budgets --account-id 687222805898`.
+
+</details>
 
 ---
 
@@ -282,7 +304,12 @@ Depends on Step 0 and a remote. The mentoring goals name CI/CD explicitly.
 
 ---
 
-## Step 9 — Confirm real costs
+## Step 9 — Confirm real costs — **blocked with Step 1**
+
+`ce:GetCostAndUsage` is explicitly denied, so Cost Explorer cannot be read from this
+account at all. Blocked until Paweł lifts the deny.
+
+<details><summary>original notes</summary>
 
 We never established Bedrock rates for Haiku 4.5 — the Price List API only carries
 legacy models and the pricing page is JS-rendered. After a day of real usage, read Cost
@@ -290,6 +317,8 @@ Explorer and write the actual per-invocation cost into `CLAUDE.md`. Measured num
 a price list we could not read.
 
 ---
+
+</details>
 
 ## Open decisions
 
