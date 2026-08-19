@@ -182,6 +182,35 @@ cd infra && AWS_PROFILE=ai-playground npx cdk diff    # safe, read-only
 
 ---
 
+## Step 8 — the login, and the smallest possible frontend
+
+**Read:** [`docs/adr/0007-user-login-through-the-hosted-ui.md`](adr/0007-user-login-through-the-hosted-ui.md),
+then `web/README.md`, then `web/app.js` (~150 lines).
+
+This is last because it is the least of the code and the most of the point. Every
+identity-derived control you met in Step 3 — the session id, the actor id, `runtimeUserId` —
+was being fed by a machine token whose `sub` is an app client id, identical for every caller.
+So the isolation was correct and had nothing to isolate. A public Cognito client with the
+authorization-code flow and PKCE puts a real person's UUID in that field, and the same three
+functions start meaning what they say.
+
+`web/` is a **test harness, not a product**: no framework, no build step, no hosting. What to
+look for while clicking it:
+
+- the `sub` it prints is a UUID — that is the whole delta from every earlier step;
+- the scope list it prints is what the Gateway interceptor will judge, so you can *predict* a
+  refusal before you cause one;
+- unchecking **photos**, logging in again and asking for photos and weather together gives you a
+  forecast, a red `get_photos` badge and an answer that admits the gap. Same code, same user,
+  different token — which is the clearest statement of what authorization means here.
+
+```bash
+./scripts/web-config.sh                          # writes the git-ignored web/config.js
+python3 -m http.server 5173 --directory web      # the port is in the callback URL
+```
+
+---
+
 ## How to test, day to day
 
 | Want | Command |
@@ -208,10 +237,14 @@ cd infra && AWS_PROFILE=ai-playground npx cdk diff    # safe, read-only
 
 ## What is deliberately missing
 
-- **A human login.** The only Cognito client is machine-to-machine, so every caller shares one
-  session and one long-term memory. The code for per-user identity is already there and
-  tested; what is missing is a hosted-UI client with the authorization-code flow. Nothing in
-  this guide needs it.
-- **A frontend.** `curl` and the `.http` files are the interface.
+- ~~**A human login.**~~ Built — see Step 8. What is still missing is a login whose identity the
+  *Runtime* verifies: the BFF authenticates the user and then **asserts** who they are to
+  AgentCore via `runtimeUserId`. ADR-0007 records why moving the Runtime to inbound JWT was kept
+  separate, and `CLAUDE.md`'s open questions keep it as the next candidate ADR.
+- **Per-user permissions.** The scopes are chosen per *request* in the page, not attached to a
+  *person*. Making two users genuinely differ needs a pre-token-generation Lambda trigger;
+  deferred, with the reasoning in ADR-0007.
+- **A frontend anyone else could use.** `web/` is a harness on `localhost`; `curl` and the
+  `.http` files remain the interface. No hosting, no TLS, no refresh tokens.
 - **Reliability.** Deliberately skipped in `docs/well-architected.md`, with the reasoning.
 - **Cost telemetry.** Denied to our role; the account cap replaces it. See `ROADMAP.md`.

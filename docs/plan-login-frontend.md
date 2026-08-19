@@ -1,8 +1,9 @@
 # Plan — user login and a minimal frontend
 
-**Status: not started.** Written 2026-08-19 to be executed by a session with no prior
-context, unattended. Read `CLAUDE.md` first, then this file top to bottom, then start at
-Phase 1.
+**Status: DONE — executed 2026-08-19, verified, stack destroyed.** See the Progress log at the
+bottom, which is the part worth reading now: what shipped, the four traps this cost, and the one
+step that cannot be run unattended. The phases below are kept as the record of what was decided
+and why.
 
 ## Your authority — read this before anything else
 
@@ -316,3 +317,93 @@ roughly a US cent).
 ## Progress log
 
 *(append as you go — this is what a later session reads first)*
+
+### 2026-08-19 — executed end to end. Done, verified, and destroyed.
+
+**Status: complete.** Every phase ran. The login works, the acceptance test passes, the machine
+path still works, CI is green, and the stack is gone.
+
+**Two things the plan could not have known, both worth more than the login itself.** The stack
+did not exist at the start of the session (the previous session had destroyed it), so this was a
+*fresh create* rather than an update — and a fresh create exposed two CDK ordering bugs that four
+previous incremental deploys had hidden:
+
+1. **`roleArn` orders the role, not the role's inline policy.** The Runtime failed with *"Access
+   denied while validating ECR URI … requires ecr:GetAuthorizationToken, ecr:BatchGetImage,
+   ecr:GetDownloadUrlForLayer"* while the next event read `RuntimeRoleDefaultPolicy … Resource
+   creation cancelled`. Fix: `runtime.node.addDependency(runtimeRole)`, which covers the whole
+   construct subtree including CDK's generated `AWS::IAM::Policy`.
+2. **That fix then broke the log group.** With the policy ordered first the runtime finally *had*
+   `logs:CreateLogGroup`, so AgentCore created its own log group 3 s after the runtime and
+   CloudFormation's `AWS::Logs::LogGroup` failed with `already exists`. The two requirements are
+   irreconcilable — you cannot own a resource whose name only exists after the thing that creates
+   it. Replaced with `logs.LogRetention` (creates only if missing, sets retention,
+   `removalPolicy: DESTROY`). **Corollary worth keeping:** the earlier deploys that "worked"
+   succeeded *because* their observability was silently broken.
+
+Both are written up in `CLAUDE.md` → "CDK ordering — two deploys, and they are the same bug
+twice".
+
+**A defect the plan asked for but under-specified.** The plan said to add CORS to the BFF's own
+responses, and that was done — but API Gateway generates its **own** 4xx before the integration
+runs (expired token, bad key, throttle) and those carry no CORS header at all. Measured with
+curl. Since tokens last an hour and there is deliberately no refresh, that 401 is the *expected*
+end of every session and the page's one recovery path depends on reading it. Added
+`addGatewayResponse` for `DEFAULT_4XX`/`DEFAULT_5XX`. Then a second trap: the header still did
+not appear until a stage deployment created *after* the gateway responses —
+`api.latestDeployment?.node.addDependency(response)`.
+
+**A CI gate that would have gone red.** `logs.LogRetention` puts a CDK-authored Lambda into
+`cdk.out`, and `verify:bundle` tried to load it and failed on a missing
+`@aws-sdk/client-cloudwatch-logs` (provided by the Lambda runtime, not by our `node_modules`).
+The script now reads this synth's template, and checks only bundles with an esbuild sourcemap
+beside them, naming what it skipped.
+
+**Verification — measured, not assumed**
+
+| Claim | Evidence |
+|---|---|
+| A real human logs in through the hosted UI | Authorization code + PKCE completed; page showed `sub 34b85488-a0a1-706b-6214-0da47ac58129` — a **UUID**, not an app client id — and `client_id 7c1op7tvj6aa0hmrng0e1rcjbe` |
+| The token carries custom scopes | All four `tools/…` scopes listed on the first login; three on the second |
+| The session id is derived from *that user's* `sub` | Page showed `c89ed4b0ad5e…`; `sha256("travel-assistant:" + sub)` = `c89ed4b0ad5e1c19…` — exact match |
+| …and differs from the machine client's | Machine client's session id `c7dc8d104993…` (from `smoke-gateway.sh`, same run) |
+| Long-term memory is now per user | Runtime span `memory.load_preferences` with `actorId u-6f7b738c85e6…`; the machine path's is `u-1519f545…` |
+| The agent answers from the browser | "What is the weather in Lisbon this weekend?" → real forecast, `toolCalls [get_weather]`, `build c0132e10360d` matching the deployed image tag |
+| **Acceptance test: same code, same user, different token** | With *photos* unchecked: "I can show you the weather, but unfortunately I don't have permission to retrieve photos" + a full 7-day forecast; badges `get_photos · blocked` (red) and `get_weather` (green) |
+| The denial is the Gateway's, and traceable | Interceptor span `gateway.authorize` `status: "blocked"`, `tool get_photos`, `grantedScopes ["weather:read","places:read","flights:read"]`, `clientId 7c1op7tvj6aa0hmrng0e1rcjbe`, carrying the browser session id |
+| CORS preflight does not demand a token | `OPTIONS /chat` with no auth and no key → `204` with `access-control-allow-origin: http://localhost:5173` |
+| API Gateway's own 401 is readable by a browser | After the fix: `401` with `access-control-allow-origin: *` |
+| The machine path still works | `./scripts/smoke-gateway.sh` — all five checks pass, three tools listed, real forecast, `blocked: true` with no agent, spans present |
+| Local gates | `typecheck` (both), `npm test` **176 pass**, `cdk synth`, `verify:bundle` 4 bundles |
+
+Screenshot of the acceptance test: [`frontend.png`](frontend.png).
+
+**Deviation from the plan, and why.** Phase 4 step 5 says "log out, uncheck photos, log in
+again". The Cognito SSO session was deliberately *kept* and only the local token cleared, so the
+second login returned a three-scope token with no password prompt. This is a **stronger**
+demonstration, not a weaker one: one user, one Cognito session, two tokens, two different
+answers — the only variable is the scope set. A full `/logout` is what a different user needs,
+and the button is there for it.
+
+**What I could not do.** Typing the test user's password into the Cognito form. Entering
+credentials is a hard prohibition on the assistant regardless of the authority this plan grants,
+so Jakub entered it (he happened to return mid-session). **A future unattended run of this plan
+will block at exactly that point** — the hosted UI cannot be scripted past. If this needs to be
+fully unattended, the options are: a pre-token-generation trigger plus `ADMIN_USER_PASSWORD_AUTH`
+(but see ADR-0007 — those tokens carry no custom scopes, so it does not work), or accepting that
+the browser step is a human step. It is a *test harness*; a human clicking it is not a defect.
+
+**Also worth knowing:** the SSO session expired mid-session (`Token has expired and refresh
+failed`) and `aws sso login --sso-session perpaul --no-browser` plus opening its URL in Chrome
+recovered it without any credential entry, because the Identity Center browser session was still
+alive. And `aws logs filter-log-events` **returns nothing at all without `--start-time`** on
+these log groups — it looks exactly like an empty group.
+
+**Spend.** Roughly 8–10 model turns across the two smoke runs and the browser (~1 US cent each),
+plus five deploys (three failed creates, one create, one update) which cost only ECR storage and
+CloudFormation time. Call it well under 0.25 USD. No cost telemetry is available, per `CLAUDE.md`.
+
+**Stack destroyed** at the end of the session, and the orphaned log group from the failed create
+was deleted by hand. Next session: `web/config.js`, `requests/local*.http` and `.test-user` are
+stale by design, the Duffel secret needs `put-secret-value` again (ROADMAP step 2), and a new
+Cognito test user must be created after the next deploy.

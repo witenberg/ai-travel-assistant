@@ -48,6 +48,10 @@ Docker Desktop must be running before any deploy that rebuilds the image.
 - One CDK stack: Cognito, Secrets Manager, Identity credential provider, Memory, Runtime,
   Gateway, log groups
 
+- User login: a real human signs in through the Cognito hosted UI (authorization code + PKCE)
+  and reaches the agent from a browser, with per-user session and long-term memory —
+  deployed and verified, see Step 10
+
 **Not built:**
 - Nothing on the original list. What remains is Step 8 (deeper observability), which was
   optional from the start.
@@ -197,11 +201,14 @@ now loads the synthesised artifact the way Lambda does, so the second one cannot
   worst case near 1 USD a day — a tenth of the account cap, which is the most we are
   willing to lose overnight to a runaway loop or a leaked key.
 
-**Known limitation:** the only Cognito client is the machine (client-credentials) one, so
-`sub` is the app client id and every caller shares one session. Custom scopes are only
-issued through the OAuth token endpoint — `USER_PASSWORD_AUTH` access tokens carry
-`aws.cognito.signin.user.admin` and nothing else — so a real per-human session needs a
-hosted-UI client with the authorization-code flow. Deferred; `curl` testing does not need it.
+**That limitation is gone (Step 10, 2026-08-19).** It used to read: the only Cognito client is
+the machine one, so `sub` is an app client id and every caller shares one session and one
+long-term memory. A second, public app client with the authorization-code flow and PKCE now
+issues tokens to real users through the hosted UI, so `sub` is a per-person UUID and the
+mapping below finally separates one person's conversation and preferences from another's. The
+reasoning is [ADR-0007](docs/adr/0007-user-login-through-the-hosted-ui.md); the note about
+`USER_PASSWORD_AUTH` carrying no custom scopes is *why* the login had to be a browser flow
+rather than a shell script, and both clients keep that flow disabled.
 
 <details><summary>original notes</summary>
 
@@ -507,17 +514,32 @@ bytes. The agent's turn answered with the forecast and refused photos honestly.
 
 ---
 
-## Step 10 — User login and a minimal frontend — **PLANNED, not started**
+## Step 10 — User login and a minimal frontend — **DONE, VERIFIED IN THE CLOUD (2026-08-19)**
 
-Full plan, written to be executed unattended by a session with no prior context:
-[`docs/plan-login-frontend.md`](docs/plan-login-frontend.md). It closes the board's
-`login (OIDC)` edge — today the only Cognito client is machine-to-machine, so `sub` is an app
-client id and every caller shares one session and one long-term memory. The per-user code is
-already written and tested; what is missing is a human in front of Cognito.
+Closes the board's last edge, `Customer --login (OIDC)--> Cognito`. Decision and rejected
+alternatives: [ADR-0007](docs/adr/0007-user-login-through-the-hosted-ui.md). Plan as executed:
+[`docs/plan-login-frontend.md`](docs/plan-login-frontend.md), including its progress log.
 
-Ten decisions are settled in the plan so the executing session needs to ask nothing. The
-prerequisite it cannot supply itself: `cdk deploy` is blocked by the auto-mode classifier, so
-`.claude/settings.json` must carry the allow rules before it starts.
+**What was built**
+
+| | |
+|---|---|
+| `WebClient` | public Cognito app client, `code` flow + PKCE, no secret, callback `http://localhost:5173/` |
+| Gateway | `allowedClients` extended to both clients — without this every browser tool call fails at the Gateway |
+| API | CORS preflight on `/chat` for one origin; the BFF adds `access-control-allow-origin` to **every** response, refusals included |
+| `web/` | `index.html`, `style.css`, `app.js` (~150 lines: PKCE, token exchange, one POST), generated `config.js` |
+| `scripts/web-config.sh` | writes `web/config.js` from the stack outputs, git-ignored like the `.http` files |
+
+**Verified** — see the plan's progress log for the measured numbers: a real user's token carries
+a UUID `sub` and the four `tools/...` scopes; the derived session id matches
+`sha256("travel-assistant:" + sub)` and differs from the machine client's; and unchecking
+*photos* before logging in produces a forecast plus an honest refusal with `get_photos`
+`blocked: true` — same code, same user, different token.
+
+**Two deploys were paid for here, both in CDK ordering rather than in the login** — see
+"Deploy ordering" in `CLAUDE.md`. The runtime had to be made to depend on its role's *inline
+policy*, not just the role; and fixing that let AgentCore win the race to create the runtime's
+log group, which broke the `AWS::Logs::LogGroup` that assumed it owned it.
 
 ---
 
@@ -539,7 +561,8 @@ prerequisite it cannot supply itself: `cdk deploy` is blocked by the auto-mode c
 |---|---|
 | ~~Lambda vs OpenAPI Gateway targets~~ | Decided in ADR-0004: Lambda target for the three keyless tools, `search_flights` stays in the Runtime |
 | ~~Whether the DynamoDB table survives~~ | Decided in ADR-0005: deleted |
-| Whether a frontend is ever built | Deferred; `curl` remains the interface |
+| ~~Whether a frontend is ever built~~ | Built in Step 10 as a deliberate *test harness*, not a product: one static page in `web/`, no framework, no hosting (ADR-0007) |
+| Whether the Runtime moves to inbound JWT | Open. The BFF asserts the user's identity to the Runtime rather than proving it; ADR-0007 explains why changing that was kept out of Step 10 |
 | ~~Git remote and where CI runs~~ | GitHub, decided 2026-08-19. CI is written and verified offline; Jakub attaches the remote (Step 7) |
 
 ## Rules that always apply

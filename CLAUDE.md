@@ -25,7 +25,9 @@ Source: FigJam `VaQhXMByHOUPwTYgNaUM85` (board "P v JW").
 - **Amazon Bedrock AgentCore** — Runtime, Gateway, Memory, Identity, Observability
 - Region: `us-east-1`
 - **One CDK stack (monolith)** — small app, and `cdk destroy` should take it all down at once
-- **No frontend** — tested with `curl`; UI some day later
+- **A frontend only as a test harness** — one static page in `web/` (no framework, no build,
+  served from `localhost`) that exists to demonstrate the login; `curl` and the `.http`
+  collections remain the working interface. ADR-0007.
 
 ## Architecture
 
@@ -172,6 +174,14 @@ Each of these cost a deploy cycle. None is guessable from the docs alone.
   TypeScript source, and synth only checks that esbuild exited zero. `npm run verify:bundle`
   loads the artifact from `cdk.out` the way Lambda does — this is the same principle as
   "`READY` and `200` do not mean it works", one layer down.
+- **`verify:bundle` must check only the bundles esbuild built for us.** Adding
+  `logs.LogRetention` put a *CDK-authored* Lambda into `cdk.out`, and loading it locally failed on
+  a missing `@aws-sdk/client-cloudwatch-logs` — a module the Lambda runtime provides and our
+  `node_modules` does not. The gate went red for something that was never our code and would have
+  broken CI. The script now reads this synth's template (which names the construct each asset
+  belongs to) and skips any bundle with no esbuild sourcemap beside it, printing what it skipped.
+  A red gate that says nothing about our code is worse than no gate, because the next person
+  silences it.
 - **`cdk.out` inherits `infra/package.json`'s `"type": "module"`.** A CJS bundle sitting
   there is parsed as ESM by Node and appears to export nothing. Lambda unzips the asset
   with no such parent, so any check must copy the artifact out of the tree first —
@@ -391,6 +401,93 @@ meet. It observes and never transforms.
   later turn in that session, replaying the original error for free. A failed handshake must be
   forgotten so the next turn retries.
 
+## CDK ordering — two deploys, and they are the same bug twice
+
+Both were found on the Step 10 deploy, neither is about the login, and neither is visible in
+`cdk synth`. The theme: **CloudFormation orders what you reference, and AgentCore does work the
+moment a resource exists.** Anything between those two facts is a race.
+
+- **`roleArn` orders the role, not the role's policy.** `CfnRuntime` takes
+  `roleArn: runtimeRole.roleArn`, so the role is created first — but the permissions CDK
+  generates from `addToPolicy`/`grantPull` live in a *separate* `AWS::IAM::Policy` resource that
+  is free to be created in parallel with the runtime. AgentCore validates the ECR image **as the
+  execution role** at create time, so losing that race fails the whole stack with a message that
+  reads like a missing permission: *"Access denied while validating ECR URI ... requires
+  ecr:GetAuthorizationToken, ecr:BatchGetImage, and ecr:GetDownloadUrlForLayer"* — while the next
+  event, `RuntimeRoleDefaultPolicy ... Resource creation cancelled`, is the actual story. Fix:
+  `runtime.node.addDependency(runtimeRole)`, which covers **every resource in the construct's
+  subtree**, generated policies included. `addResourceDependency(role.node.defaultChild)` would
+  not. Read a "missing IAM permission" on a resource whose policy is in the same stack as an
+  ordering bug until proven otherwise.
+- **You cannot own the Runtime's log group, only its retention** — and the previous fix is what
+  exposed this. The group's name contains the runtime id, so it can only be created *after* the
+  runtime; the runtime's role holds `logs:CreateLogGroup` precisely so AgentCore can create it.
+  Measured: AgentCore created it **3 s** after the runtime, CloudFormation reached its own
+  `AWS::Logs::LogGroup` a second later, `already exists`, stack rolled back. The two requirements
+  are in direct conflict. `logs.LogRetention` is the construct for a group somebody else owns —
+  it creates the group only if missing, sets the retention, and with
+  `removalPolicy: RemovalPolicy.DESTROY` deletes it on teardown. Same two guarantees, no
+  ownership claim. Verified after the deploy: the group exists with `retentionInDays: 7`.
+- **The earlier deploys that "worked" were the broken ones.** Before the policy was ordered
+  first, the role had no `logs:CreateLogGroup` when the runtime started, so AgentCore silently
+  could not create the group and CloudFormation won by default. That is the same silence
+  `CLAUDE.md` already recorded under the Runtime section — the deploy succeeded *because* its
+  observability was failing. A green deploy can be green for the wrong reason.
+- **The Gateway's log group needs none of this.** It is created lazily on the first request,
+  long after CloudFormation is done, so `new logs.LogGroup` there is correct and stayed.
+- **A `ROLLBACK_COMPLETE` stack must be deleted before the next attempt**, and a rolled-back
+  runtime leaves its auto-created log group behind — exactly the orphan the CDK declaration
+  exists to prevent. Check `aws logs describe-log-groups --log-group-name-prefix
+  /aws/bedrock-agentcore` after any failed deploy.
+
+## Login and the browser harness — Step 10
+
+- **`allowedClients` on the Gateway is the single most likely thing to forget.** Add a Cognito
+  app client and the Gateway rejects its tokens until that client id is on the list. The symptom
+  is a perfect login followed by *every* tool call failing, which reads as a broken agent rather
+  than a missing config line.
+- **`USER_PASSWORD_AUTH` tokens carry no custom scopes** — only
+  `aws.cognito.signin.user.admin`. They pass API Gateway's authorizer and are then refused by
+  every tool at the Gateway, so the two layers disagree. Both clients keep the flow disabled;
+  this is why the login had to be a browser flow rather than a shell script.
+- **API Gateway's `authorizationScopes` is an OR, not an AND.** All four tool scopes are listed
+  on the `POST /chat` method and a token holding *one* of them is admitted — which is what makes
+  the "uncheck photos, keep weather" demonstration reach the BFF at all. An AND would refuse the
+  request before the interceptor could produce its denial trace. (Do not add `authorizationScopes`
+  per tool for the same reason: the per-tool decision belongs to the Gateway interceptor.)
+- **CORS has to cover the error responses, not just the preflight.** API Gateway's mock `OPTIONS`
+  integration handles the preflight; it says nothing about what the BFF returns. Without
+  `access-control-allow-origin` on a 403, the browser reports a CORS failure and hides the status
+  and the body — the failures worth debugging are exactly the ones that vanish. The header is in
+  `respond()` in `src/bff/handler.ts` and there is a test asserting it on every refusal.
+- **The preflight must not require the authorizer or the API key.** A preflight carries neither,
+  so demanding them refuses the request before the token is ever seen. CDK's
+  `defaultCorsPreflightOptions` gets this right (`AuthorizationType: NONE`, `ApiKeyRequired:
+  false`) — worth confirming in the synthesized template rather than trusting.
+- **PKCE: base64url with no padding.** A padded `code_challenge` comes back as a bare
+  `invalid_grant` from the token endpoint, one redirect after the mistake was made.
+- **`admin-set-user-password --permanent`**, or the user sits in `FORCE_CHANGE_PASSWORD` and the
+  hosted UI demands a new password that a scripted check cannot supply.
+- **The callback URL is compared as a string**, trailing slash included, which is why the page is
+  served on `:5173` and the port is not a preference.
+- **Log out of Cognito, not just of the page.** Clearing the token locally leaves Cognito's own
+  session alive, so the next login silently reuses it. Useful either way: with the SSO session
+  kept, re-authorizing with a different `scope` returns a *new* token with the new scopes and no
+  password prompt — which is how the scope demonstration was verified as one user in one Cognito
+  session. But a full `/logout` is what a *different* user needs, hence the button.
+- **`access-control-allow-origin` on the BFF is still not enough.** API Gateway generates its own
+  4xx before the integration runs — expired token, bad key, throttle — and those carry no CORS
+  header unless `addGatewayResponse` adds one. In a browser `fetch` then rejects and the status is
+  unreadable, so the page cannot tell "log in again" from "the network broke". Since tokens last
+  an hour and there is no refresh, that response is the **expected** end of every session.
+- **A `GatewayResponse` only takes effect through a stage deployment created after it, and CDK
+  does not order that.** Both `AWS::ApiGateway::GatewayResponse` resources reached
+  CREATE_COMPLETE twelve seconds before the new `Deployment`, the deployment hash did change,
+  and a 401 forty seconds later still had no header. One `aws apigateway create-deployment` by
+  hand fixed it instantly. The durable fix is
+  `api.latestDeployment?.node.addDependency(response)`. Same shape as `READY` not meaning it
+  works: "CloudFormation created it" is not "the stage serves it".
+
 ## Tool design principles
 
 Lessons from the first iteration, each paid for with a real agent failure:
@@ -438,22 +535,31 @@ guardrail that stays. We deploy through the CDK bootstrap roles (variant B in
 `cdk deploy` → `CREATE_COMPLETE` → `cdk destroy` → `DELETE_COMPLETE`. The chain
 `deploy-role → cfn-exec → IAM` works end to end.
 
-### Deployed resources (2026-08-19)
+### Deployed resources (last deploy: 2026-08-19, Step 10)
+
+**Every id below is generated per deploy and dies with `cdk destroy`.** They are recorded for
+the *shape* of the names, and to be pasted into a CLI call during the session that created them
+— never as something to rely on later. Read the current ones with
+`aws cloudformation describe-stacks --stack-name TravelAssistantStack --query 'Stacks[0].Outputs'`.
 
 | | |
 |---|---|
-| Runtime | `travel_assistant-m6PLoMGxv5`, endpoint `DEFAULT`, version 2 |
-| Memory | `travel_assistant_memory-Np64SnHkoA` |
+| Runtime | `travel_assistant-LCs4339NIh`, endpoint `DEFAULT` |
+| Memory | `travel_assistant_memory-lQYhDD9Ym2` |
 | Credential provider | `token-vault/default/apikeycredentialprovider/duffel-api-key` |
-| Cognito | `us-east-1_WuhBjq1L7`, machine client `2499r5au4tmahnuon9daeruiid` |
-| Memory strategy | `travel_preferences-6n4o2nBeG6` (`USER_PREFERENCE`), namespace `/preferences/{actorId}` |
-| Log group | `/aws/bedrock-agentcore/runtimes/travel_assistant-m6PLoMGxv5-DEFAULT` |
-| Gateway | `travel-assistant-gateway-cxvsjwdkbj`, MCP endpoint `https://travel-assistant-gateway-cxvsjwdkbj.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp` |
-| Gateway target | `travel-tools` (id `ZO1C1YZ8PI`) — Lambda, three keyless tools |
+| Cognito | `us-east-1_Vde4DnTJZ` |
+| — machine client | `10s7l94t8eelbjsti5jbd9n3pv` (client-credentials, has a secret) |
+| — web client | `7c1op7tvj6aa0hmrng0e1rcjbe` (authorization code + PKCE, **public, no secret**) |
+| Hosted UI | `https://travel-assistant-687222805898.auth.us-east-1.amazoncognito.com`, callback `http://localhost:5173/` |
+| Memory strategy | `travel_preferences-TMFcuQ3m7F` (`USER_PREFERENCE`), namespace `/preferences/{actorId}` |
+| Log group | `/aws/bedrock-agentcore/runtimes/travel_assistant-LCs4339NIh-DEFAULT` |
+| Gateway | `travel-assistant-gateway-nlgadbdrbi`, MCP endpoint `https://travel-assistant-gateway-nlgadbdrbi.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp` |
+| Gateway target | `travel-tools` (id `UK4XU4QEQV`) — Lambda, three keyless tools |
 | Gateway Lambdas | `travel-assistant-gateway-interceptor`, `travel-assistant-gateway-response-interceptor`, `travel-assistant-gateway-tools` |
-| API | `https://ef1qmnowze.execute-api.us-east-1.amazonaws.com/v1/chat` |
+| API | `https://1nrpdfts6h.execute-api.us-east-1.amazonaws.com/v1/chat` |
 | Lambda BFF | `travel-assistant-bff`, log group `/aws/lambda/travel-assistant-bff` |
 | Usage plan | `travel-assistant-plan` — 2 rps, burst 5, 100 requests/day |
+| Test user | `traveler@example.test`, created by CLI after deploy; password in git-ignored `.test-user` |
 
 Invoke it with `aws bedrock-agentcore invoke-agent-runtime`; the session id must be at
 least 33 characters. Payload is `{"prompt": "...", "scopes": [...]}` base64-encoded.
@@ -488,8 +594,8 @@ normally. We show `cdk diff` before every deploy anyway.
 
 **CI:** `.github/workflows/ci.yml`, see ADR-0006. Green on GitHub in ~25 s per run. Run the same checks locally before pushing:
 `npm run typecheck && npm run test:offline && (cd infra && npx cdk synth --quiet) && npm run verify:bundle`.
-`npm test` (161) includes six tests that call open-meteo, Wikipedia and Commons;
-`npm run test:offline` (155) is the CI gate and skips them.
+`npm test` (176) includes six tests that call open-meteo, Wikipedia and Commons;
+`npm run test:offline` (170) is the CI gate and skips them.
 
 ## What to do next
 
@@ -504,6 +610,22 @@ budget allows. Application logic stays deliberately small so the infrastructure 
 the interesting part. Full statement in `README.md`.
 
 ## Decisions made
+
+- **ADR-0007** — a human logs in through the **Cognito hosted UI**: a second, *public* app client
+  with the authorization-code flow and PKCE, plus one static page in `web/` served from
+  `http://localhost:5173/`. This is what makes `deriveSessionId`/`deriveActorId` mean anything —
+  until now the only client was machine-to-machine, so `sub` was an app client id and the whole
+  system shared one session and one long-term memory. The scopes a token asks for are chosen in
+  the page with checkboxes, because Cognito scopes are per client and per request: the honest
+  demonstration is that the Gateway interceptor judges *the token in front of it*. Rejected: a
+  client secret in the page (a secret in a browser is not one); `USER_PASSWORD_AUTH`, which
+  yields **no custom scopes** and so passes API Gateway while failing every tool — two layers
+  disagreeing is the failure mode this project keeps paying for; moving the Runtime to inbound
+  JWT, which is the real remaining weakness but would rewrite the machine path on the same day;
+  per-user scopes via a pre-token-generation Lambda trigger, the honest way to differ *users*,
+  deferred until the question is "what may this person do"; S3 + CloudFront hosting, on budget
+  and scope; and dropping `apiKeyRequired`, which would trade the 100/day quota — a real budget
+  control — for tidiness about a non-secret.
 
 - **ADR-0006** — CI runs on every pull request and stops at the edge of the AWS account:
   `.env` must not be tracked, both typechecks, the offline tests, `cdk synth`, and
@@ -567,9 +689,12 @@ the interesting part. Full statement in `README.md`.
 
 - [ ] Nothing blocking. Step 2's unknown is answered: the token arrives as a request header,
       but only when the invocation carries `runtimeUserId` (see the Identity section above).
-      What is left is a judgement call, not a blocker — whether the Runtime should move to
-      inbound JWT so the user's identity is proved cryptographically rather than asserted by
-      the BFF. Worth an ADR if a real human user ever replaces the machine client.
+      What is left is the same judgement call, and it is now sharper rather than resolved —
+      **a real human user has replaced the machine client** (ADR-0007), and the BFF still
+      *asserts* that person's identity to the Runtime instead of proving it. ADR-0007 records
+      why the change was kept out of Step 10 (it would rewrite the machine path, including the
+      `InvokeAgentRuntimeForUser` route ADR-0002's credential delivery depends on), not why it
+      is unnecessary. This is the strongest candidate for the next ADR.
 
 ## Outbound auth — `search_flights`
 
@@ -605,6 +730,13 @@ the photos really are from the place rather than name-matched.
 
 The cost is that we will not exercise AgentCore Browser hands-on — but spending budget
 on a component whose free alternative is better would teach the wrong lesson.
+
+**There is a frontend now, and it is a harness rather than a product.** The board draws no UI at
+all, and `web/` is not an attempt to add one: it is the smallest thing that makes the login edge
+observable — one static page, no framework, no build step, no hosting, served from `localhost`
+and thrown away with the stack. Its job is to show a `sub`, a scope list and a per-tool verdict,
+which is evidence, not a feature. Fourth deviation, and the only one that *adds* something: the
+other three drop what adds no data.
 
 **The DynamoDB "app data" table is gone.** Full argument in ADR-0005: nothing ever read or
 wrote it, and the two kinds of state this system has are both covered — preferences by
