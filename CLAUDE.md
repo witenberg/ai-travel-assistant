@@ -80,6 +80,9 @@ flowchart LR
 | `get_photos()` | Wikimedia Commons geosearch | returns author and licence |
 | `search_flights()` | Duffel | **the only tool with outbound auth** (bearer token) |
 
+The first three run in a **Gateway Lambda target** after ADR-0004; `search_flights` stays in
+the Runtime container because its credential comes from the Identity token vault.
+
 > On the diagram the labels inside the Runtime box are shifted by one row.
 > The table above is the agreed, correct mapping.
 >
@@ -213,6 +216,53 @@ Each of these cost a deploy cycle. None is guessable from the docs alone.
   concurrently, then `memory.save_turn` 110–131 ms. Against ADR-0001's ~29 s ceiling this
   is affordable, but it is the first thing on the critical path that is not a model call.
 
+## AgentCore Gateway — facts and traps found while wiring it up
+
+Built in ROADMAP step 4, design in ADR-0004. Everything here is verified against the docs
+or against `cdk synth`, not remembered.
+
+- **Gateway and gateway-target names forbid underscores** — validated against
+  `^([0-9a-zA-Z][-]?){1,100}$`. `CfnRuntime` is the opposite: `travel_assistant` *needs*
+  them. So the gateway is `travel-assistant-gateway` and the target is `travel-tools`.
+  `cdk synth` reports the mismatch as a **warning**, not an error, so it is easy to deploy
+  straight past it.
+- **The Gateway is an MCP server, not an AWS API.** There is no `InvokeGatewayTool` SDK
+  call: `attrGatewayUrl` is a full endpoint ending in `/mcp`, and a client speaks JSON-RPC
+  2.0 over Streamable HTTP. `src/mcp/client.ts` is ours, hand-rolled, ~200 lines.
+- **A Lambda target receives the tool arguments as its whole `event`.** The tool name comes
+  from `context.clientContext.custom.bedrockAgentCoreToolName`, prefixed with the target
+  name and `___`, and the docs are explicit that **stripping the prefix is the function's
+  job**. `src/gateway/naming.ts` owns that string for all three components that need it.
+- **`interceptionPoints` are exactly `REQUEST` and `RESPONSE`**, at most one interceptor of
+  each per gateway. A REQUEST interceptor runs on *every* call — `initialize`,
+  `notifications/initialized`, `tools/list` — so anything that is not `tools/call` has to be
+  passed through explicitly.
+- **A REQUEST interceptor answers the caller by returning `transformedGatewayResponse`.**
+  Return it and the target is never invoked. Our denial is shaped as a JSON-RPC *success*
+  carrying `isError: true`, because that reaches the model as a failed `tool_result` it can
+  explain, whereas a JSON-RPC error surfaces as a broken tool.
+- **The interceptor sees request headers only with `passRequestHeaders: true`**, which means
+  it holds a live access token in memory. There is a test asserting it never writes one to a
+  log.
+- **`Session → trace → span` does not survive the Gateway on its own.** AgentCore forwards
+  no session id to a target or an interceptor. The interceptor gets ours back because the
+  MCP client sends `x-travel-session-id`; the **target Lambda cannot**, so a tool-execution
+  span correlates through the interceptor's span for the same MCP message id.
+- **A Lambda target's credential config is `GATEWAY_IAM_ROLE`** with
+  `iamCredentialProvider: { service: 'lambda', region }`. The other types (`OAUTH`,
+  `API_KEY`, `CALLER_IAM_CREDENTIALS`, `JWT_PASSTHROUGH`) are for targets needing an
+  outbound credential injected.
+- **`allowedClients`, not `allowedAudience`, for Cognito machine tokens.** A
+  client-credentials access token carries `client_id` and no `aud`, so an audience check
+  rejects every token our machine client issues.
+- **`SchemaDefinition` is a subset of JSON Schema** — `type`, `description`, `properties`,
+  `required`, `items`, and nothing else. `infra/lib/tool-schema.ts` generates the target's
+  schema from each tool's own `inputSchema` and **throws** on any other keyword rather than
+  dropping it.
+- **Gateway logs go to `/aws/bedrock-agentcore/gateways/<gatewayId>`** and the role needs
+  `logs:CreateLogGroup` for the same reason the Runtime did. We declare the group in CDK so
+  it expires and so `cdk destroy` removes it.
+
 ## Tool design principles
 
 Lessons from the first iteration, each paid for with a real agent failure:
@@ -277,7 +327,12 @@ guardrail that stays. We deploy through the CDK bootstrap roles (variant B in
 Invoke it with `aws bedrock-agentcore invoke-agent-runtime`; the session id must be at
 least 33 characters. Payload is `{"prompt": "...", "scopes": [...]}` base64-encoded.
 
-**Not deployed yet:** AgentCore Gateway with tool targets. It goes into this same stack.
+**Built, not yet deployed (ROADMAP step 4):** AgentCore Gateway, its Lambda target and its
+REQUEST interceptor, plus the agent's MCP client. `cdk synth`, `npm run verify:bundle` and
+144 unit tests pass; `cdk diff` shows 11 new resources and the Runtime updated in place.
+Verify with `./scripts/smoke-gateway.sh` after the deploy — it speaks MCP to the Gateway
+directly first, with no agent in the path, because that is the only way to tell whether a
+refusal came from the Gateway or from our own code.
 
 **Still a placeholder:** the Duffel secret holds `REPLACE_ME`, and the tool does not yet
 read from the Identity token vault, so `search_flights` fails in the cloud. The other
@@ -306,6 +361,18 @@ budget allows. Application logic stays deliberately small so the infrastructure 
 the interesting part. Full statement in `README.md`.
 
 ## Decisions made
+
+- **ADR-0004** — the three keyless tools move behind AgentCore Gateway as one Lambda target,
+  and the **caller's own Cognito token** is forwarded (BFF → Runtime → Gateway) so a REQUEST
+  interceptor can authorize each tool call against the *user's* scopes. Rejected: an M2M
+  token belonging to the agent, which would have made the Gateway authenticate the agent and
+  left per-user scopes with nowhere to be enforced. `search_flights` stays in the Runtime
+  because ADR-0002 routes its credential through the Identity token vault, which a Gateway
+  Lambda target cannot reach. `tools/list` is deliberately **not** filtered by scope: hiding
+  a tool would remove the denial trace the observability requirement is built on. And the
+  rule the two ADRs together imply — **memory is an enhancement and degrades quietly, tools
+  are the product and fail loudly**: an unreachable Gateway fails the turn rather than
+  offering the model a silently shrunken toolset.
 
 - **Entry layer (Step 3)** — API Gateway REST rather than HTTP API, because the Cognito
   authorizer, usage plans and API keys we depend on are REST features and HTTP API has
@@ -337,8 +404,10 @@ the interesting part. Full statement in `README.md`.
 
 ## Open questions
 
-- [ ] Nothing blocking. Next decision arrives with the Gateway targets: whether all four
-      tools move behind the Gateway as Lambda targets, or only the ones that benefit.
+- [ ] Nothing blocking. The Gateway target question is answered in ADR-0004 (three tools
+      move, `search_flights` stays). What is genuinely unresolved is still Step 2: how code
+      inside the Runtime obtains its workload access token, which is what `search_flights`
+      needs to read the Duffel key from the token vault.
 
 ## Outbound auth — `search_flights`
 
@@ -405,12 +474,14 @@ Modern Anthropic models are reachable **only through inference profiles** (`us.`
 The cheapest model from a generation that handles tool calling reliably, and the tool
 logic here is simple. The model id is a parameter so swapping it is a one-line change.
 
-**No cost telemetry at all.** `budgets:ViewBudget` and `ce:GetCostAndUsage` are both
-*explicitly denied* to `MB-EmployeeAccess` (verified 2026-08-19), so we can neither set a
-budget alert nor read actual spend. Every cost control is preventive and architectural:
-the 100 requests/day API Gateway quota, the 2 rps throttle, on-demand billing, no
-always-on components, `cdk destroy` after every session. Lifting this is a request for
-Paweł, in the same conversation as `docs/blocker-iam.md`.
+**No cost telemetry at all, and we have accepted that.** `budgets:ViewBudget` and
+`ce:GetCostAndUsage` are both *explicitly denied* to `MB-EmployeeAccess` (verified
+2026-08-19), so we can neither set a budget alert nor read actual spend. **We are not
+chasing it** — the account has a hard 10 USD/month cap, which is the same protection a
+budget alert would give us, enforced one level higher. Cost stays an architectural
+concern, not a measured one: the 100 requests/day API Gateway quota, the 2 rps throttle,
+on-demand billing, no always-on components, `cdk destroy` after every session. Design
+cheaply, then stop thinking about it.
 
 **Bedrock pricing:** the AWS Price List API only carries legacy models and the pricing
 page is JS-rendered — **we have no confirmed Bedrock rates for 4.5+ models**. Anthropic

@@ -17,7 +17,8 @@ aws cloudformation describe-stacks --stack-name TravelAssistantStack \
   --query 'Stacks[0].StackStatus' --output text     # or "does not exist" if destroyed
 
 cd /Users/jakub.wi/Desktop/ai_app
-npm test && npm run typecheck                # 80 tests must pass
+npm test && npm run typecheck                # 144 tests must pass
+npm run verify:bundle                        # after any cdk synth, before any deploy
 ```
 
 If the stack is gone, redeploy takes ~3 minutes:
@@ -50,9 +51,20 @@ Docker Desktop must be running before any deploy that rebuilds the image.
 **Created but unused:**
 - DynamoDB table — no code touches it (step 6 decides its fate)
 
+**Built, not yet deployed:**
+- AgentCore Gateway, its Lambda target and its REQUEST interceptor, and the agent's MCP
+  client — see Step 4
+
 **Not built:**
-- AgentCore Gateway with tool targets
 - CI/CD
+
+**Removed from this roadmap (2026-08-19):** the two cost-telemetry steps — an AWS Budgets
+guardrail and a Cost Explorer reconciliation. Both are *explicitly denied* to
+`MB-EmployeeAccess`, and the account carries a hard 10 USD/month cap anyway, so the
+guardrail they would add already exists one level up. Jakub's decision: stop spending
+sessions on it. We still design for cost — cheap model, on-demand billing, nothing
+always-on, the 100 requests/day quota — we just no longer treat *measuring* it as work.
+Do not re-add these steps.
 
 ---
 
@@ -78,45 +90,6 @@ It is also the cheapest possible step.
 
 **Verify:** `git status` clean, `git log` has one commit, `git ls-files | grep -c '\.env$'`
 returns 0.
-
-</details>
-
----
-
-## Step 1 — Budget guardrail — **BLOCKED (2026-08-19), needs Paweł**
-
-Both routes are denied to `MB-EmployeeAccess`, by an *explicit deny* rather than a
-missing grant — so no amount of policy attachment on our side changes it:
-
-```
-budgets:ViewBudget  -> AccessDeniedException ... with an explicit deny in an identity-based policy
-ce:GetCostAndUsage  -> AccessDeniedException ... with an explicit deny in an identity-based policy
-```
-
-This is the same guardrail family as the IAM deny in `docs/blocker-iam.md`. Do not spend
-another session on it; it is a request for Paweł — either a budget created on his side
-with an alert to Jakub, or `ce:GetCostAndUsage` granted so we can read spend ourselves.
-
-**Consequence, and it matters:** we have *no* automated cost signal and no way to read
-actual spend. Every cost control is therefore architectural and preventive — the 100
-requests/day usage-plan quota, the 2 rps throttle, on-demand billing everywhere, no
-always-on components, and `cdk destroy` after each session. That also means Step 9
-(confirm real costs) cannot be done from this account at all until the deny is lifted.
-
-<details><summary>original notes</summary>
-
-**Why:** the account cap is 10 USD and nothing currently warns us. Every other step
-spends money. This is the only step that protects the others.
-
-- AWS Budgets: a cost budget at 5 USD with an email alert, plus a forecast alert
-- Consider a second alert at 8 USD
-
-**Known risk:** Budgets lives under billing permissions, which are frequently denied on
-member accounts. If `aws budgets create-budget` fails, that is a request for Paweł —
-do not spend a session fighting it. Fallback: a CloudWatch billing alarm, or a manual
-Cost Explorer check at the start of each session.
-
-**Verify:** the budget is listed by `aws budgets describe-budgets --account-id 687222805898`.
 
 </details>
 
@@ -236,38 +209,80 @@ token returns 401; a client-supplied `sessionId` in the body is ignored.
 
 ---
 
-## Step 4 — AgentCore Gateway with tool targets
+## Step 4 — AgentCore Gateway — **BUILT, NOT YET DEPLOYED (2026-08-19)**
 
-**The largest step, and the one closest to the project's purpose.** Everything so far
-uses Runtime, Identity, Memory and Observability; the Gateway is the remaining major
+Design and rejected alternatives: [ADR-0004](docs/adr/0004-tools-behind-the-gateway.md).
+**The largest step, and the one closest to the project's purpose** — everything before it
+used Runtime, Identity, Memory and Observability; the Gateway is the remaining major
 AgentCore capability, and it is what the FigJam diagram actually draws.
 
-**Decision required before coding** (see ADR-0002 for the trade-off already analysed):
-- **Lambda targets** keep our tested transformations (IATA resolution, weekday names,
-  Commons attribution) but the Gateway does not inject outbound credentials for them
-- **OpenAPI targets** let the Gateway inject credentials and need no code, but hand the
-  model raw JSON, which contradicts the tool-design principles in `CLAUDE.md`
+**Ready to deploy.** `cdk diff` shows 11 new resources and the Runtime updated in place:
 
-A defensible split: Lambda targets for the three transforming tools, plus one trivial
-OpenAPI target purely to demonstrate Gateway-injected credentials.
+| | |
+|---|---|
+| New | `GatewayRole`, `GatewayInterceptor` + log group, `GatewayToolTarget` + log group, `Gateway`, `GatewayLogs`, `ToolTarget`, three IAM roles/policies |
+| Changed | `Runtime` — gains `GATEWAY_URL`, a dependency on `ToolTarget`, and a new image |
+| Checks that passed | 144 unit tests, `tsc --noEmit` in both trees, `cdk synth` with no warnings, `npm run verify:bundle` over all three Lambda bundles |
 
-**Work:**
-- `CfnGateway` with `authorizerType: CUSTOM_JWT` and a `CustomJWTAuthorizer` pointing at
-  the Cognito discovery URL
-  (`https://cognito-idp.us-east-1.amazonaws.com/us-east-1_WuhBjq1L7/.well-known/openid-configuration`),
-  `allowedClients` set to the machine client
-- `CfnGatewayTarget` per tool, with `credentialProviderConfigurations`
-- **Interceptors** enforcing scopes — this replaces `src/guard.ts` in production;
-  keep `guard.ts` as the local mirror so tests still run offline
-- The agent must become an MCP client to reach Gateway tools. This is the real refactor:
-  `src/agent.ts` currently executes tools in process
-- Gateway logs are **not** configured automatically — see `CLAUDE.md`, log delivery for
-  gateway and memory resources must be set up explicitly
+Docker Desktop must be running — the container image is rebuilt.
 
-**Verify:** a scope-denied call produces the `blocked` trace *from the Gateway*, not from
-our code, and the deployed agent still answers correctly with tools it is allowed.
+**Deploy:** `cd infra && npx cdk deploy --require-approval never` (Jakub runs this himself,
+prefixed with `!`).
 
----
+**Then verify:** `./scripts/smoke-gateway.sh`. It asks Cognito for a token with
+`tools/weather:read tools/places:read` and deliberately **not** `tools/photos:search`, then:
+
+1. speaks MCP to the Gateway **directly, with no agent in the path** — `tools/list` must
+   return three tools named `travel-tools___*`. This is first on purpose and costs no model
+   tokens: when a tool call is refused, removing our own code from the request is the only
+   way to know who refused it.
+2. `tools/call travel-tools___get_weather` — must return a real forecast.
+3. `tools/call travel-tools___get_photos` — must come back `isError` with `blocked: true`.
+   There is no agent in that request, so the refusal can only be the interceptor's.
+4. reads `/aws/lambda/travel-assistant-gateway-interceptor` for a `gateway.authorize` span
+   with status `blocked` — the diagram's denial trace, now written by the component that
+   actually made the decision.
+5. asks the agent for photos *and* weather through the API — expect the forecast plus an
+   honest refusal about photos, and `toolCalls` showing `get_photos` blocked.
+
+**What was built**
+
+- `src/mcp/client.ts` — a minimal MCP client over Streamable HTTP (`initialize`,
+  `tools/list`, `tools/call`), handling both a JSON and an SSE-framed reply, paginating the
+  tool list, and never echoing the body of a 401/403.
+- `src/tools/provider.ts` — the `ToolProvider` seam. `LocalToolProvider` runs tools in
+  process under `guard.ts`; `CompositeToolProvider` routes by name and, deliberately, never
+  falls back to another provider.
+- `src/tools/gatewayProvider.ts` — the Gateway-backed provider. Strips the
+  `travel-tools___` prefix so the model, the spans and the smoke tests keep naming tools the
+  way the source does, and caches the catalogue per container.
+- `src/gateway/toolTarget.ts` — one Lambda serving all three tools, dispatching on the tool
+  name from the client context. Imports the same `getWeather` the agent used to call, so the
+  existing tool tests still cover the logic.
+- `src/gateway/interceptor.ts` — the REQUEST interceptor. Per-tool scope enforcement, failing
+  closed on an unknown tool or an unreadable token, and writing the `blocked` span.
+- `infra/lib/tool-schema.ts` — generates each target `ToolDefinition` from the tool's own
+  `inputSchema`, throwing on any JSON Schema keyword AgentCore's `SchemaDefinition` lacks.
+- The BFF now forwards the caller's access token; the Runtime hands it to the Gateway as the
+  MCP bearer.
+
+**Traps already paid for, without a deploy**
+
+- Gateway and target names **forbid underscores** while the Runtime's name requires them.
+  `cdk synth` reports it as a warning only.
+- `Session → trace → span` does not cross the Gateway by itself. The interceptor gets the
+  session id back through our own `x-travel-session-id` header; the target Lambda cannot get
+  it at all.
+- All of these and more are in `CLAUDE.md`, section "AgentCore Gateway".
+
+**Known open ends**
+
+- The Gateway's own log group may stay empty: log delivery for gateway resources is not
+  configured automatically, and we did not set up a `Logs::Delivery` chain. It does not
+  matter for the requirement, because the denial span lives in the interceptor's own group.
+- `guard.ts` is now only reached for `search_flights` and in tests. It stays as the offline
+  mirror of the interceptor, which is what lets the whole authorization rule be tested with
+  no AWS at all.
 
 ## Step 5 — Memory — **DONE, VERIFIED IN THE CLOUD (2026-08-19)**
 
@@ -382,27 +397,11 @@ Depends on Step 0 and a remote. The mentoring goals name CI/CD explicitly.
 
 ---
 
-## Step 9 — Confirm real costs — **blocked with Step 1**
-
-`ce:GetCostAndUsage` is explicitly denied, so Cost Explorer cannot be read from this
-account at all. Blocked until Paweł lifts the deny.
-
-<details><summary>original notes</summary>
-
-We never established Bedrock rates for Haiku 4.5 — the Price List API only carries
-legacy models and the pricing page is JS-rendered. After a day of real usage, read Cost
-Explorer and write the actual per-invocation cost into `CLAUDE.md`. Measured numbers beat
-a price list we could not read.
-
----
-
-</details>
-
 ## Open decisions
 
 | Decision | Notes |
 |---|---|
-| Lambda vs OpenAPI Gateway targets | Step 4; trade-off already analysed in ADR-0002 |
+| ~~Lambda vs OpenAPI Gateway targets~~ | Decided in ADR-0004: Lambda target for the three keyless tools, `search_flights` stays in the Runtime |
 | Whether the DynamoDB table survives | Step 6; deletion is fine |
 | Whether a frontend is ever built | Deferred; `curl` remains the interface |
 | Git remote and where CI runs | Step 0/7 |

@@ -64,6 +64,17 @@ export class Trace {
     this.record(name, 'blocked', Date.now(), attributes);
   }
 
+  /**
+   * The `blocked` counterpart for a decision that went the other way.
+   *
+   * A permitted call is worth a span of its own: without it, the absence of a `blocked`
+   * span is the only evidence that authorization happened, and absence is exactly what a
+   * component that silently never ran also looks like.
+   */
+  ok(name: string, attributes: Record<string, unknown>): void {
+    this.record(name, 'ok', Date.now(), attributes);
+  }
+
   private record(name: string, status: SpanStatus, startedAt: number, attributes: Record<string, unknown>): void {
     this.emit({
       type: 'span',

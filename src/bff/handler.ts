@@ -4,7 +4,7 @@ import {
   InvokeAgentRuntimeCommand,
 } from '@aws-sdk/client-bedrock-agentcore';
 import { Trace } from '../observability/trace.js';
-import { ALL_SCOPES } from '../guard.js';
+import { bearerToken, extractScopes } from '../auth/scopes.js';
 
 /**
  * Backend for Frontend.
@@ -21,18 +21,24 @@ import { ALL_SCOPES } from '../guard.js';
  * would be a second implementation of the same rule, free to drift from the first.
  */
 
-/** The Cognito resource server that carries our tool scopes; its id prefixes every scope. */
-const SCOPE_PREFIX = 'tools/';
-
 /** AgentCore rejects session ids shorter than this. A sha256 hex digest is 64. */
 const MIN_SESSION_ID_LENGTH = 33;
 
-const KNOWN_SCOPES: readonly string[] = ALL_SCOPES;
+// Re-exported because the tests and the smoke script name it here; the rule itself is
+// shared with the Gateway interceptor, so it lives in one place.
+export { extractScopes };
 
 /** Minimal shape of an API Gateway REST proxy event — only the fields we read. */
 export interface ProxyEvent {
   body?: string | null;
   isBase64Encoded?: boolean;
+  /**
+   * Raw request headers. We read exactly one, `Authorization`, and only to forward the
+   * caller's access token to the Runtime so AgentCore Gateway can authorize each tool call
+   * against the user's own scopes (ADR-0004). It is never logged and never parsed here —
+   * API Gateway has already validated it.
+   */
+  headers?: Record<string, string | undefined>;
   requestContext?: {
     requestId?: string;
     authorizer?: { claims?: Record<string, string | undefined> };
@@ -72,23 +78,6 @@ export function deriveSessionId(sub: string): string {
 export function deriveActorId(sub: string): string {
   // Leading letter: AgentCore requires an actor id to start alphanumeric.
   return `u-${createHash('sha256').update(`travel-assistant-actor:${sub}`).digest('hex')}`;
-}
-
-/**
- * Tool scopes granted by the token.
- *
- * Cognito emits the `scope` claim as a space-delimited list of fully qualified scopes
- * (`tools/weather:read`). We strip the resource-server prefix so the agent sees the same
- * short names `guard.ts` uses, and drop anything we do not recognise — `openid`,
- * `aws.cognito.signin.user.admin` and friends are not tool permissions.
- */
-export function extractScopes(scopeClaim: string | undefined): string[] {
-  if (!scopeClaim) return [];
-  return scopeClaim
-    .split(/\s+/)
-    .filter((s) => s.startsWith(SCOPE_PREFIX))
-    .map((s) => s.slice(SCOPE_PREFIX.length))
-    .filter((s) => KNOWN_SCOPES.includes(s));
 }
 
 function respond(statusCode: number, body: unknown): ProxyResult {
@@ -163,6 +152,17 @@ export function createHandler(deps: HandlerDeps = {}) {
       });
     }
 
+    // The token itself, not its claims: the Gateway needs a bearer it can validate on its
+    // own, and the claims API Gateway parsed for us cannot be turned back into one.
+    const accessToken = bearerToken(event.headers);
+    if (!accessToken) {
+      // Unreachable through the authorizer, which rejects a request with no bearer. Reached
+      // only if the method is wired without one, and then the agent's Gateway calls would
+      // fail one layer deeper with a far less obvious message.
+      trace.blocked('bff.authorize', { decision: 'deny', reason: 'no bearer token on the request' });
+      return respond(401, { error: 'request carries no bearer token' });
+    }
+
     const scopes = extractScopes(claims.scope);
     if (scopes.length === 0) {
       // Fail closed, and fail before Bedrock. Every tool would be blocked downstream
@@ -179,7 +179,9 @@ export function createHandler(deps: HandlerDeps = {}) {
           runtimeSessionId: sessionId,
           contentType: 'application/json',
           accept: 'application/json',
-          payload: new TextEncoder().encode(JSON.stringify({ prompt, scopes, actorId })),
+          payload: new TextEncoder().encode(
+            JSON.stringify({ prompt, scopes, actorId, accessToken }),
+          ),
         })),
       );
 

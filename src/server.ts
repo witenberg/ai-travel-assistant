@@ -3,6 +3,12 @@ import { randomUUID } from 'node:crypto';
 import { runAgent, type AgentResult } from './agent.js';
 import { ALL_SCOPES } from './guard.js';
 import { memoryStoreFromEnv, type MemoryStore } from './memory/store.js';
+import { LOCAL_TOOLS, TOOLS } from './tools/index.js';
+import { CompositeToolProvider, LocalToolProvider, type ToolProvider } from './tools/provider.js';
+import { GatewayToolProvider, type ToolSpecCache } from './tools/gatewayProvider.js';
+import { McpClient } from './mcp/client.js';
+import { SESSION_HEADER as GATEWAY_SESSION_HEADER } from './gateway/interceptor.js';
+import { Trace } from './observability/trace.js';
 
 /**
  * AgentCore Runtime HTTP service contract.
@@ -39,6 +45,57 @@ interface InvocationPayload {
    * reading another actor's long-term memory impossible.
    */
   actorId?: string;
+  /**
+   * The caller's Cognito access token, forwarded verbatim by the BFF.
+   *
+   * The agent does not read it — it hands it to AgentCore Gateway as the MCP bearer, so
+   * the Gateway authorizes each tool call against the *user's* scopes. The alternative was
+   * an M2M token belonging to the agent itself, which would have made per-user
+   * authorization at the Gateway impossible; see ADR-0004.
+   *
+   * Server-supplied like `scopes` and `actorId`: only the BFF holds `InvokeAgentRuntime`.
+   */
+  accessToken?: string;
+}
+
+/**
+ * Chooses where tools come from, once per turn.
+ *
+ * Three cases, and the middle one is the security-relevant one:
+ *   - no `GATEWAY_URL`: everything runs in process under `guard.ts`. This is `npm run dev`
+ *     and every test.
+ *   - `GATEWAY_URL` set but no access token: refuse the turn. Falling back to in-process
+ *     execution would look like resilience and would in fact bypass the authorization we
+ *     deployed the Gateway to perform.
+ *   - both present: the Gateway serves its tools and `search_flights` stays local, because
+ *     its credential comes from the Identity token vault (ADR-0002).
+ */
+export function buildToolProvider(args: {
+  scopes: readonly string[];
+  accessToken?: string;
+  sessionId: string;
+  gatewayUrl?: string;
+  specCache?: ToolSpecCache;
+}): ToolProvider {
+  const gatewayUrl = args.gatewayUrl ?? process.env.GATEWAY_URL;
+  if (!gatewayUrl) return new LocalToolProvider(TOOLS, args.scopes);
+
+  if (!args.accessToken) {
+    throw new Error('GATEWAY_URL is configured but the invocation carried no access token');
+  }
+
+  const client = new McpClient({
+    url: gatewayUrl,
+    accessToken: args.accessToken,
+    // Carries the session id across the Gateway so a denial recorded by the interceptor
+    // belongs to the same Session -> trace -> span hierarchy as the rest of the turn.
+    extraHeaders: { [GATEWAY_SESSION_HEADER]: args.sessionId },
+  });
+
+  return new CompositeToolProvider([
+    new GatewayToolProvider(client, args.specCache),
+    new LocalToolProvider(LOCAL_TOOLS, args.scopes),
+  ]);
 }
 
 /**
@@ -98,12 +155,17 @@ function readBody(req: IncomingMessage): Promise<string> {
   });
 }
 
-export function createServer(deps: { runAgent?: AgentRunner; memory?: MemoryStore } = {}) {
+export function createServer(
+  deps: { runAgent?: AgentRunner; memory?: MemoryStore; tools?: ToolProvider } = {},
+) {
   const agent = deps.runAgent ?? runAgent;
   // Built once per container, not per request: the store owns an SDK client, and the
   // connection pool and credential cache are the whole reason to keep it alive.
   const memory = deps.memory ?? memoryStoreFromEnv();
   const health = new HealthState();
+  // Container-scoped: the Gateway's tool catalogue is the same for every caller, so the
+  // `tools/list` round trip is paid once per container rather than once per turn.
+  const specCache: ToolSpecCache = {};
 
   return createHttpServer(async (req, res) => {
     const url = (req.url ?? '/').split('?')[0];
@@ -132,11 +194,32 @@ export function createServer(deps: { runAgent?: AgentRunner; memory?: MemoryStor
       // local runs; in production the BFF maps the user to a session before we see it.
       const sessionId = (req.headers[SESSION_HEADER] as string | undefined) ?? `local-${randomUUID()}`;
 
+      const scopes = payload.scopes ?? [...ALL_SCOPES];
+
+      let tools: ToolProvider;
+      try {
+        tools = deps.tools ?? buildToolProvider({
+          scopes,
+          accessToken: payload.accessToken,
+          sessionId,
+          specCache,
+        });
+      } catch (err) {
+        // Fail closed and say so. A misconfigured Gateway must not degrade into local
+        // execution, because local execution is the path whose authorization we moved away.
+        new Trace(sessionId).blocked('agent.tool_provider', {
+          decision: 'deny',
+          reason: err instanceof Error ? err.message : String(err),
+        });
+        return sendJson(res, 403, { error: 'tools are unavailable for this request', status: 'error' });
+      }
+
       const result: AgentResult = await agent(prompt, {
         sessionId,
         actorId: payload.actorId ?? sessionId,
-        scopes: payload.scopes ?? [...ALL_SCOPES],
+        scopes,
         memory,
+        tools,
       });
 
       return sendJson(res, 200, {

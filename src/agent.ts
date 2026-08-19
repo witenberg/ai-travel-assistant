@@ -4,8 +4,9 @@ import {
   type Message,
   type ContentBlock,
 } from '@aws-sdk/client-bedrock-runtime';
-import { TOOLS, byName, toolConfig, ToolError } from './tools/index.js';
-import { authorize, ALL_SCOPES } from './guard.js';
+import { toolConfig } from './tools/index.js';
+import { LocalToolProvider, type ToolProvider } from './tools/provider.js';
+import { ALL_SCOPES } from './guard.js';
 import { Trace } from './observability/trace.js';
 import { buildSystemPrompt } from './prompt.js';
 import { NullMemoryStore, type MemoryStore, type MemoryRef } from './memory/store.js';
@@ -29,6 +30,13 @@ export interface AgentOptions {
   actorId?: string;
   /** AgentCore Memory. Defaults to a no-op so a local run needs no AWS resource. */
   memory?: MemoryStore;
+  /**
+   * Where tools come from and who authorizes them. Defaults to in-process execution
+   * guarded by `guard.ts`, which is what a local run and every offline test use. In the
+   * cloud this is a Gateway-backed provider, and then the authorization decision is
+   * AgentCore's rather than ours.
+   */
+  tools?: ToolProvider;
   client?: BedrockRuntimeClient;
 }
 
@@ -46,6 +54,7 @@ export async function runAgent(userMessage: string, opts: AgentOptions): Promise
     modelId = DEFAULT_MODEL_ID,
     actorId = sessionId,
     memory = new NullMemoryStore(),
+    tools = new LocalToolProvider(undefined, scopes),
     client = new BedrockRuntimeClient({ region: process.env.AWS_REGION ?? 'us-east-1' }),
   } = opts;
 
@@ -54,6 +63,10 @@ export async function runAgent(userMessage: string, opts: AgentOptions): Promise
 
   const [history, preferences] = await recall(memory, ref, userMessage, opts.history, trace);
   const systemPrompt = buildSystemPrompt(new Date(), preferences);
+
+  // Asked once per turn, before the first model call. With a Gateway provider this is a
+  // `tools/list` round trip, so it is memoised per container rather than per turn.
+  const specs = await trace.span('tools.list', {}, () => tools.list());
 
   const messages: Message[] = [...history, { role: 'user', content: [{ text: userMessage }] }];
   const toolCalls: AgentResult['toolCalls'] = [];
@@ -65,7 +78,7 @@ export async function runAgent(userMessage: string, opts: AgentOptions): Promise
           modelId,
           system: [{ text: systemPrompt }],
           messages,
-          toolConfig: toolConfig(TOOLS),
+          toolConfig: toolConfig(specs),
           inferenceConfig: { maxTokens: 1500, temperature: 0.3 },
         }),
       ),
@@ -84,7 +97,7 @@ export async function runAgent(userMessage: string, opts: AgentOptions): Promise
     // Tools from one turn run in parallel — the model may request several at once.
     const requests = (reply.content ?? []).filter((b) => b.toolUse);
     const results = await Promise.all(
-      requests.map((block) => executeToolBlock(block, scopes, trace, toolCalls)),
+      requests.map((block) => executeToolBlock(block, tools, trace, toolCalls)),
     );
 
     messages.push({ role: 'user', content: results });
@@ -146,39 +159,34 @@ async function remember(
   }
 }
 
+/**
+ * Runs one requested tool and shapes the reply the model will read.
+ *
+ * All the branching that used to live here — unknown tool, denied scope, tool failure —
+ * now belongs to the provider, because the answer differs by where the tool runs. What
+ * stays is the part that is the same either way: a failure comes back as an error
+ * `tool_result`, never as a thrown exception, so one refused tool cannot end the turn.
+ */
 async function executeToolBlock(
   block: ContentBlock,
-  scopes: readonly string[],
+  tools: ToolProvider,
   trace: Trace,
   toolCalls: AgentResult['toolCalls'],
 ): Promise<ContentBlock> {
   const use = block.toolUse!;
   const name = use.name!;
-  const tool = byName(name);
 
-  if (!tool) {
-    toolCalls.push({ name, blocked: true });
-    return errorResult(use.toolUseId!, `Unknown tool "${name}".`);
-  }
+  const outcome = await tools.call(name, use.input, trace);
+  toolCalls.push({ name, blocked: outcome.blocked === true });
 
-  const decision = authorize(tool, scopes, trace);
-  if (!decision.allowed) {
-    toolCalls.push({ name, blocked: true });
-    return errorResult(use.toolUseId!, decision.reason!);
-  }
-
-  toolCalls.push({ name, blocked: false });
-  try {
-    const output = await trace.span('tool.execute', { tool: name, input: use.input }, () =>
-      tool.execute(use.input as never),
-    );
-    return { toolResult: { toolUseId: use.toolUseId!, content: [{ json: output as any }], status: 'success' } };
-  } catch (err) {
-    // A tool failure returns to the model as a tool_result rather than killing the turn.
-    // The model can then try a different route, or tell the user what was missing.
-    const message = err instanceof ToolError ? err.message : `Unexpected error: ${err}`;
-    return errorResult(use.toolUseId!, message);
-  }
+  if (outcome.error !== undefined) return errorResult(use.toolUseId!, outcome.error);
+  return {
+    toolResult: {
+      toolUseId: use.toolUseId!,
+      content: [{ json: outcome.output as any }],
+      status: 'success',
+    },
+  };
 }
 
 const errorResult = (toolUseId: string, message: string): ContentBlock => ({

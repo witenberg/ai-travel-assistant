@@ -23,9 +23,17 @@ const handler = createHandler({ client: fakeClient, runtimeArn: RUNTIME_ARN });
 
 const SUB = '9f3c1a20-0000-4000-8000-000000000001';
 
-const invoke = (body: unknown, claims: Record<string, string> = {}) =>
+/** Stand-in for a Cognito access token. Never parsed by the BFF, only forwarded. */
+const ACCESS_TOKEN = 'header.payload.signature';
+
+const invoke = (
+  body: unknown,
+  claims: Record<string, string> = {},
+  headers: Record<string, string | undefined> = { Authorization: `Bearer ${ACCESS_TOKEN}` },
+) =>
   handler({
     body: typeof body === 'string' ? body : JSON.stringify(body),
+    headers,
     requestContext: { authorizer: { claims: { sub: SUB, scope: 'tools/weather:read', ...claims } } },
   });
 
@@ -130,6 +138,46 @@ describe('scope extraction', () => {
 
   test('treats a missing claim as no permissions', () => {
     assert.deepEqual(extractScopes(undefined), []);
+  });
+});
+
+describe('forwarding the access token', () => {
+  /*
+   * ADR-0004: the Gateway authorizes each tool call against the *caller's* scopes, so the
+   * caller's own token has to reach the agent. The claims API Gateway parsed for us cannot
+   * be turned back into a token the Gateway would accept, which is why the raw header is
+   * read here at all.
+   */
+  test('the runtime receives the caller\'s access token', async () => {
+    await invoke({ prompt: 'Weather in Lisbon?' });
+    const payload = JSON.parse(new TextDecoder().decode(lastInput.payload));
+    assert.equal(payload.accessToken, ACCESS_TOKEN);
+  });
+
+  test('a request with no bearer header is refused without invoking the runtime', async () => {
+    const response = await invoke({ prompt: 'Weather in Lisbon?' }, {}, {});
+    assert.equal(response.statusCode, 401);
+    assert.equal(lastInput, null, 'the runtime must not be invoked without a token to pass on');
+  });
+
+  test('reads the header whatever its casing, as a proxy may rewrite it', async () => {
+    await invoke({ prompt: 'Weather in Lisbon?' }, {}, { authorization: `bearer ${ACCESS_TOKEN}` });
+    const payload = JSON.parse(new TextDecoder().decode(lastInput.payload));
+    assert.equal(payload.accessToken, ACCESS_TOKEN);
+  });
+
+  // The BFF now handles a bearer token on a path that also writes spans. A token in a log
+  // line is a token in CloudWatch.
+  test('never writes the token into a span', async () => {
+    const spans: any[] = [];
+    const original = console.error;
+    console.error = (line: string) => { try { spans.push(JSON.parse(line)); } catch { /* not a span */ } };
+    try {
+      await invoke({ prompt: 'Weather in Lisbon?', sessionId: 'someone-else' });
+    } finally {
+      console.error = original;
+    }
+    assert.ok(!JSON.stringify(spans).includes(ACCESS_TOKEN), 'a span quoted the access token');
   });
 });
 

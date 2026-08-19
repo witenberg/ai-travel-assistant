@@ -12,6 +12,18 @@ export interface Tool<I = any, O = unknown> {
   execute(input: I): Promise<O>;
 }
 
+/**
+ * What the model is told about one tool: the Converse `toolSpec` fields, and nothing else.
+ *
+ * Lives here rather than next to `ToolProvider` so `toolConfig` can use it without
+ * importing the provider module, which imports this one.
+ */
+export interface ToolSpec {
+  readonly name: string;
+  readonly description: string;
+  readonly inputSchema: Record<string, unknown>;
+}
+
 export class ToolError extends Error {
   constructor(message: string, readonly retryable = false) {
     super(message);
