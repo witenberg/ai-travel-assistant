@@ -3,3 +3,7 @@ cdk.out/
 *.log
 .env
 dist/
+
+# Generated .http files hold a client secret and an API key
+requests/local.http
+requests/local-gateway.http

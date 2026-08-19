@@ -1,0 +1,129 @@
+### AgentCore Gateway, spoken to directly — no agent in the path
+#
+# This is the file that answers "who actually said no". Every request here is plain JSON-RPC
+# 2.0 over HTTP to the Gateway's `/mcp` endpoint, with a Cognito token as the bearer. There
+# is no model call and no container of ours involved, so it costs nothing and any refusal is
+# demonstrably AgentCore's decision rather than our code's.
+#
+# A TEMPLATE — generate the runnable copy with `./scripts/http-requests.sh`.
+# Send `token` first, then `initialize`, then the rest.
+
+@tokenEndpoint = __TOKEN_ENDPOINT__
+@basicAuth = __BASIC_AUTH__
+@gatewayUrl = __GATEWAY_URL__
+
+### token WITHOUT the photos scope — so one tool is allowed and one is not
+# @name token
+POST {{tokenEndpoint}}
+Authorization: Basic {{basicAuth}}
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=client_credentials&scope=tools/weather:read tools/places:read
+
+### initialize — the MCP handshake
+# The Gateway supports exactly one protocol version, `2025-03-26`, and says so usefully if you
+# send another. Note what comes back in `result.protocolVersion`: a client should adopt that
+# answer rather than keep announcing its own preference. Ours does; the first smoke script
+# pinned a version and broke on first contact.
+POST {{gatewayUrl}}
+Authorization: Bearer {{token.response.body.access_token}}
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Protocol-Version: 2025-03-26
+x-travel-session-id: http-file-session
+
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "initialize",
+  "params": {
+    "protocolVersion": "2025-03-26",
+    "capabilities": {},
+    "clientInfo": { "name": "http-file", "version": "1.0" }
+  }
+}
+
+### tools/list — what the model would be told it can do
+# Three tools, each named `travel-tools___<tool>`: AgentCore prefixes every tool with its
+# target's name, and stripping that prefix is the client's job (src/gateway/naming.ts).
+#
+# Note what is NOT happening here: the list is not filtered by scope. Hiding a tool the caller
+# may not use would remove the denial trace the observability requirement is built on
+# (ADR-0004), so the catalogue is the same for everyone and the refusal happens at call time.
+POST {{gatewayUrl}}
+Authorization: Bearer {{token.response.body.access_token}}
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Protocol-Version: 2025-03-26
+x-travel-session-id: http-file-session
+
+{ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }
+
+### tools/call get_weather — scope granted, expect a real forecast
+# The `weekday` field is computed by the tool, not by the model. The model was off by one day
+# when it derived weekdays itself, which is why that field exists.
+POST {{gatewayUrl}}
+Authorization: Bearer {{token.response.body.access_token}}
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Protocol-Version: 2025-03-26
+x-travel-session-id: http-file-session
+
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "tools/call",
+  "params": { "name": "travel-tools___get_weather", "arguments": { "city": "Lisbon" } }
+}
+
+### tools/call get_photos — scope NOT granted, expect blocked: true
+# THE experiment. `{"error":"Missing scope \"photos:search\"...","blocked":true}` with
+# `isError: true`, produced by the REQUEST interceptor before the target Lambda ran at all.
+# Before the Gateway existed, the same refusal was produced by our own code, inside the
+# component being restricted — which is not a control, it is a promise.
+#
+# Then look at /aws/lambda/travel-assistant-gateway-interceptor for a `gateway.authorize` span
+# with status `blocked`, carrying `x-travel-session-id` above as its sessionId.
+POST {{gatewayUrl}}
+Authorization: Bearer {{token.response.body.access_token}}
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Protocol-Version: 2025-03-26
+x-travel-session-id: http-file-session
+
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "method": "tools/call",
+  "params": { "name": "travel-tools___get_photos", "arguments": { "place": "Lisbon" } }
+}
+
+### tools/call an unknown tool — expect a refusal too, because the interceptor fails closed
+# A tool the Gateway serves but our interceptor does not know cannot have its required scope
+# looked up, and "unknown, therefore allowed" is how a target added without a matching code
+# change ends up with no authorization at all.
+POST {{gatewayUrl}}
+Authorization: Bearer {{token.response.body.access_token}}
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Protocol-Version: 2025-03-26
+x-travel-session-id: http-file-session
+
+{
+  "jsonrpc": "2.0",
+  "id": 5,
+  "method": "tools/call",
+  "params": { "name": "travel-tools___drop_database", "arguments": {} }
+}
+
+### a deliberately wrong protocol version — the Gateway tells you what it supports
+# Expect `{"code":-32600,"message":"Unsupported protocol version: 2025-06-18", ...}` naming
+# `["2025-03-26"]`. Worth sending once: this is the error our client survives by negotiating.
+POST {{gatewayUrl}}
+Authorization: Bearer {{token.response.body.access_token}}
+Content-Type: application/json
+Accept: application/json, text/event-stream
+Mcp-Protocol-Version: 2025-06-18
+x-travel-session-id: http-file-session
+
+{ "jsonrpc": "2.0", "id": 6, "method": "tools/list", "params": {} }

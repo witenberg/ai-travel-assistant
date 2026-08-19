@@ -1,0 +1,137 @@
+### The travel assistant, by hand — through the front door
+#
+# API Gateway -> Cognito authorizer -> Lambda BFF -> AgentCore Runtime -> Gateway -> tools.
+#
+# This file is a TEMPLATE with placeholders. Generate the runnable copy:
+#
+#     ./scripts/http-requests.sh          # writes requests/local.http, git-ignored
+#
+# Then open requests/local.http and click "Send Request" (VS Code REST Client) or the
+# gutter arrow (JetBrains HTTP client). Run `get a machine token` first — every later
+# request reuses its response.
+#
+# Why a generated copy: the client secret and the API key are real credentials. They belong
+# in a file git never sees, which is why this template holds placeholders and the generated
+# one is in .gitignore.
+
+@tokenEndpoint = __TOKEN_ENDPOINT__
+@clientId = __CLIENT_ID__
+@clientSecret = __CLIENT_SECRET__
+@apiUrl = __API_URL__
+@apiKey = __API_KEY__
+# Pre-encoded so this works in every HTTP client: some encode `Basic user:pass` for you,
+# some do not, and a half-encoded header fails as a confusing 400.
+@basicAuth = __BASIC_AUTH__
+
+### get a machine token
+# Scopes are the interesting part: this is what the Gateway interceptor will enforce, per
+# tool, later in the chain. Drop `tools/photos:search` from the list and the agent can still
+# be *asked* for photos — it just gets refused, and says so. That is the whole demo.
+# @name token
+POST {{tokenEndpoint}}
+Authorization: Basic {{basicAuth}}
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=client_credentials&scope=tools/weather:read tools/places:read tools/photos:search tools/flights:read
+
+### ask the agent — weather (expect a forecast, toolCalls: [get_weather])
+# Look at three fields in the response:
+#   toolCalls  — which tools ran and whether any was blocked
+#   sessionId  — derived from the token's `sub`; you never sent it
+#   build      — which container answered, so a stale warm container cannot fool you
+POST {{apiUrl}}
+Authorization: Bearer {{token.response.body.access_token}}
+x-api-key: {{apiKey}}
+Content-Type: application/json
+
+{
+  "prompt": "What is the weather in Lisbon this weekend?"
+}
+
+### ask the agent — a follow-up with no place name in it (proves short-term memory)
+# Send this straight after the previous one. There is no "Lisbon" in this question, so an
+# answer naming Lisbon can only have come from AgentCore Memory.
+POST {{apiUrl}}
+Authorization: Bearer {{token.response.body.access_token}}
+x-api-key: {{apiKey}}
+Content-Type: application/json
+
+{
+  "prompt": "And what is it like there next Tuesday?"
+}
+
+### ask the agent — place details plus photos
+POST {{apiUrl}}
+Authorization: Bearer {{token.response.body.access_token}}
+x-api-key: {{apiKey}}
+Content-Type: application/json
+
+{
+  "prompt": "Tell me about Porto and show me a few photos."
+}
+
+### ask the agent — flights (the only tool with an outbound credential)
+# The Duffel key is read from the AgentCore Identity token vault at call time. Duffel test
+# mode covers a subset of routes, so an empty result is a normal answer, not a bug.
+POST {{apiUrl}}
+Authorization: Bearer {{token.response.body.access_token}}
+x-api-key: {{apiKey}}
+Content-Type: application/json
+
+{
+  "prompt": "Find flights from London to Lisbon on 2026-09-02."
+}
+
+### a token WITHOUT the photos scope
+# @name narrowToken
+POST {{tokenEndpoint}}
+Authorization: Basic {{basicAuth}}
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=client_credentials&scope=tools/weather:read tools/places:read
+
+### ask for photos with that narrow token (expect an honest refusal)
+# `toolCalls` will contain `{"name":"get_photos","blocked":true}` and the answer will say
+# plainly that it may not fetch photos. The decision was made by the Gateway interceptor,
+# outside our container — see requests/gateway.http for the same denial with no agent at all.
+POST {{apiUrl}}
+Authorization: Bearer {{narrowToken.response.body.access_token}}
+x-api-key: {{apiKey}}
+Content-Type: application/json
+
+{
+  "prompt": "Show me photos of Lisbon and tell me the weather there."
+}
+
+### the client tries to supply its own sessionId (expect it to be ignored)
+# The response still carries the *derived* session id. The attempt is recorded as a
+# `bff.client_supplied_identity` span in /aws/lambda/travel-assistant-bff — evidence that it
+# happened, rather than a silent drop.
+POST {{apiUrl}}
+Authorization: Bearer {{token.response.body.access_token}}
+x-api-key: {{apiKey}}
+Content-Type: application/json
+
+{
+  "prompt": "Hello",
+  "sessionId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "scopes": ["flights:read"]
+}
+
+### no token at all (expect 401 from API Gateway, before any of our code runs)
+POST {{apiUrl}}
+x-api-key: {{apiKey}}
+Content-Type: application/json
+
+{
+  "prompt": "Hello"
+}
+
+### no API key (expect 403 — the usage plan is the budget brake)
+POST {{apiUrl}}
+Authorization: Bearer {{token.response.body.access_token}}
+Content-Type: application/json
+
+{
+  "prompt": "Hello"
+}
